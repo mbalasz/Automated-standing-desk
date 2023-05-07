@@ -43,14 +43,14 @@ int presetButtonPressedTimeMs = -1;
 
 Preferences preferences;
 
-void getPreferencesKeyFromNumber(unsigned int preferencesKeyNumber, char* const preferencesKeyStr) {
+void intToString(unsigned int preferencesKeyNumber, char* const preferencesKeyStr) {
   sprintf(preferencesKeyStr, "%u", preferencesKeyNumber);
 }
 
 void storePreset(unsigned int presetNumber, unsigned int deskHeight) {
   Serial.println((String)"Storing preset: " + presetNumber + " with value: " + deskHeight);
   char presetNumberStr[3];
-  getPreferencesKeyFromNumber(presetNumber, presetNumberStr);
+  intToString(presetNumber, presetNumberStr);
   preferences.begin(PRESET_PREFS_NAMESPACE);
   preferences.putUInt(presetNumberStr, deskHeight);
   preferences.end();
@@ -58,7 +58,7 @@ void storePreset(unsigned int presetNumber, unsigned int deskHeight) {
 
 unsigned int readPreset(unsigned int presetNumber) {
   char presetNumberStr[3];
-  getPreferencesKeyFromNumber(presetNumber, presetNumberStr);
+  intToString(presetNumber, presetNumberStr);
   preferences.begin(PRESET_PREFS_NAMESPACE);
   unsigned int presetValue = preferences.getUInt(presetNumberStr);
   preferences.end();
