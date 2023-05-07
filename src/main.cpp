@@ -24,7 +24,7 @@ double maxSpeedDelayMs = 1.5;
 double minSpeedDelayMs = 0.23;
 double currSpeedDelayMs = maxSpeedDelayMs;
 double delayDeltaPerMs = (maxSpeedDelayMs - minSpeedDelayMs) / accelerationTimeMs;
-int prevTimeMs = -1;
+int prevLoopTimeMs = -1;
 
 const unsigned int MOTOR_MAX_STEPS = 183000;
 bool enabled = false;
@@ -115,7 +115,7 @@ void setStop() {
   enabled = false;
   currMotionState = MOTION_STATE_DISABLED;
   currSpeedDelayMs = maxSpeedDelayMs;
-  prevTimeMs = -1;
+  prevLoopTimeMs = -1;
   storeDeskHeight(currDeskHeight);
   setDeskHeightBoundaries(0, MOTOR_MAX_STEPS);
 }
@@ -207,13 +207,13 @@ void loop() {
   checkMoveButtonStates();
   if (enabled && isWithinHeightBoundaries(currDeskHeight + currMotionState)) {
     int currTimeMs = millis();
-    if (prevTimeMs == -1) {
-      prevTimeMs = currTimeMs;
+    if (prevLoopTimeMs == -1) {
+      prevLoopTimeMs = currTimeMs;
     } else if (currSpeedDelayMs > minSpeedDelayMs) {
-      int elapsedTimeMs = currTimeMs - prevTimeMs;
+      int elapsedTimeMs = currTimeMs - prevLoopTimeMs;
       currSpeedDelayMs -= delayDeltaPerMs * elapsedTimeMs;
       currSpeedDelayMs = max(currSpeedDelayMs, minSpeedDelayMs);
-      prevTimeMs = currTimeMs;
+      prevLoopTimeMs = currTimeMs;
     }
     digitalWrite(STEP_PIN, HIGH);
     delayMicroseconds((int) (delayBasicMs * 1000));
