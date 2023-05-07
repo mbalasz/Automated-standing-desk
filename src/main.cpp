@@ -1,5 +1,5 @@
 #include <Arduino.h>
-#include <EEPROM.h>
+#include <Preferences.h>
 
 #define DESK_UP_PIN 12
 #define DESK_DOWN_PIN 14
@@ -10,61 +10,81 @@
 #define DIR_PIN 19
 #define DIR_GROUND_PIN 18
 #define STEP_PIN 4
-#define EEPROM_SIZE 3
-#define EEPROM_MAX_VALUE 255
 #define MOTION_STATE_UP 1
 #define MOTION_STATE_DOWN -1
 #define MOTION_STATE_DISABLED 0
 
+#define PRESET_PREFS_NAMESPACE "preset"
+#define DESK_PREFS_NAMESPACE "desk"
+#define DESK_PREFS_HEIGHT_KEY "height"
+
 const double delayBasicMs = 0.1;
-int accelerationTimeMs = 1800;
+unsigned int accelerationTimeMs = 1800;
 double maxSpeedDelayMs = 1.5;
 double minSpeedDelayMs = 0.23;
 double currSpeedDelayMs = maxSpeedDelayMs;
 double delayDeltaPerMs = (maxSpeedDelayMs - minSpeedDelayMs) / accelerationTimeMs;
 int prevTimeMs = -1;
 
-const int MOTOR_MAX_STEPS = 183000;
+const unsigned int MOTOR_MAX_STEPS = 183000;
 bool enabled = false;
-int maxDeskHeightInSteps = MOTOR_MAX_STEPS;
-int minDeskHeightInSteps = 0;
-int currDeskHeightInSteps = 0;
+unsigned int maxDeskHeight = MOTOR_MAX_STEPS;
+unsigned int minDeskHeight = 0;
+unsigned int currDeskHeight = 0;
 int currMotionState = 0; // -1: moving down, 1: moving up, 0: not moving
 
-int lastMoveUpButtonState = HIGH;
-int lastMoveDownButtonState = HIGH;
+int moveUpButtonLastState = HIGH;
+int moveDownButtonLastState = HIGH;
 
 const int PRESET_BUTTONS_PINS[] = {25, 32};
 int presetButtonStates[] = {HIGH, HIGH};
 int presetButtonLastState = HIGH;
 int presetButtonPressedTimeMs = -1;
 
-int toNormalized(int deskHeightInSteps) {
-  return (double) deskHeightInSteps / MOTOR_MAX_STEPS * EEPROM_MAX_VALUE;
+Preferences preferences;
+
+void getPreferencesKeyFromNumber(unsigned int preferencesKeyNumber, char* const preferencesKeyStr) {
+  sprintf(preferencesKeyStr, "%u", preferencesKeyNumber);
 }
 
-int fromNormalized(int deskHeightNormalized) {
-  return (double) deskHeightNormalized / EEPROM_MAX_VALUE * MOTOR_MAX_STEPS;
+void storePreset(unsigned int presetNumber, unsigned int deskHeight) {
+  Serial.println((String)"Storing preset: " + presetNumber + " with value: " + deskHeight);
+  char presetNumberStr[3];
+  getPreferencesKeyFromNumber(presetNumber, presetNumberStr);
+  preferences.begin(PRESET_PREFS_NAMESPACE);
+  preferences.putUInt(presetNumberStr, deskHeight);
+  preferences.end();
 }
 
-void storePreset(int presetNumber, int deskHeightInSteps) {
-  int deskHeightNormalized = toNormalized(deskHeightInSteps);
-  Serial.print("Storing preset: ");
-  Serial.print(presetNumber);
-  Serial.print(", ");
-  Serial.println(deskHeightNormalized);
-  EEPROM.write(presetNumber, deskHeightNormalized);
-  EEPROM.commit();
+unsigned int readPreset(unsigned int presetNumber) {
+  char presetNumberStr[3];
+  getPreferencesKeyFromNumber(presetNumber, presetNumberStr);
+  preferences.begin(PRESET_PREFS_NAMESPACE);
+  unsigned int presetValue = preferences.getUInt(presetNumberStr);
+  preferences.end();
+  Serial.println((String)"Retrieved preset: " + presetNumber + " with value: " + presetValue);
+  return presetValue;
 }
 
-int readPreset(int presetNumber) {
-  int normalizedDeskHeight = EEPROM.read(presetNumber);
-  Serial.print("Reading preset: ");
-  Serial.print(presetNumber);
-  Serial.print(", ");
-  Serial.println(normalizedDeskHeight);
+void storeDeskHeight(unsigned int height) {
+  Serial.println((String)"Storing height: " + height);
+  preferences.begin(DESK_PREFS_NAMESPACE);
+  preferences.putUInt(DESK_PREFS_HEIGHT_KEY, height);
+  preferences.end();
+}
 
-  return fromNormalized(normalizedDeskHeight);
+unsigned int readDeskHeight() {
+  preferences.begin(DESK_PREFS_NAMESPACE);
+  unsigned int height = preferences.getUInt(DESK_PREFS_HEIGHT_KEY);
+  preferences.end();
+  Serial.println((String)"Retrieved height: " + height);
+  return height;
+}
+
+void setDeskHeightBoundaries(unsigned int minHeight, unsigned int maxHeight) {
+  Serial.println((String)"Setting desk height boundaries to: (" + minHeight + "," + maxHeight + ")");
+  minDeskHeight = max(0U, minHeight);
+  maxDeskHeight = min(MOTOR_MAX_STEPS, maxHeight);
 }
 
 void setMoveUp() {
@@ -91,52 +111,43 @@ void setStop() {
   if (!enabled) { 
     return; 
   }
-  Serial.println("setStop");
+  Serial.println((String) "setStop at height: " + currDeskHeight);
   enabled = false;
   currMotionState = MOTION_STATE_DISABLED;
   currSpeedDelayMs = maxSpeedDelayMs;
   prevTimeMs = -1;
-  Serial.println(currDeskHeightInSteps);
-  EEPROM.write(0, currDeskHeightInSteps / MOTOR_MAX_STEPS * EEPROM_MAX_VALUE);
-  EEPROM.commit();
-  maxDeskHeightInSteps = MOTOR_MAX_STEPS;
-  minDeskHeightInSteps = 0;
+  storeDeskHeight(currDeskHeight);
+  setDeskHeightBoundaries(0, MOTOR_MAX_STEPS);
 }
 
-void setMoveToPresetHeight(int heightInSteps) {
+void setMoveToHeight(unsigned int height) {
   if (enabled) {
+    // Ignore new actions when the desk is already moving.
     return;
   }
-  Serial.print("preset: ");
-  Serial.println(heightInSteps);
-  if (currDeskHeightInSteps > heightInSteps) {
-    minDeskHeightInSteps = max(0, heightInSteps);
+  Serial.println((String) "Moving to height: " + height);
+  if (currDeskHeight > height) {
+    setDeskHeightBoundaries(height, MOTOR_MAX_STEPS);
     setMoveDown();
   } else {
-    maxDeskHeightInSteps = min(MOTOR_MAX_STEPS, heightInSteps);
+    setDeskHeightBoundaries(0, height);
     setMoveUp();
   }
-  Serial.print("Setting min max desk heights: ");
-  Serial.print(minDeskHeightInSteps);
-  Serial.print(", ");
-  Serial.println(maxDeskHeightInSteps);
 }
 
-void onPresetButtonDown(int presetNumber) {
+void onPresetButtonDown(unsigned int presetNumber) {
   if (presetButtonStates[presetNumber] == HIGH) {
-    Serial.println("Preset button pressed");
     presetButtonPressedTimeMs = millis();
     presetButtonStates[presetNumber] = LOW; 
   }
 }
 
-void onPresetButtonUp(int presetNumber) {
+void onPresetButtonUp(unsigned int presetNumber) {
   if (presetButtonStates[presetNumber] == LOW) {
-    Serial.println("Preset button released");
     if (millis() - presetButtonPressedTimeMs > 2000) {
-      storePreset(presetNumber + 1, currDeskHeightInSteps);
+      storePreset(presetNumber + 1, currDeskHeight);
     } else {
-      setMoveToPresetHeight(readPreset(presetNumber + 1));
+      setMoveToHeight(readPreset(presetNumber + 1));
     }
     presetButtonStates[presetNumber] = HIGH;
   }
@@ -154,27 +165,27 @@ void checkPresetButtonStates() {
 }
 
 void checkMoveButtonStates() {
-  int currMoveUpButtonState = digitalRead(DESK_UP_PIN);
-  if (currMoveUpButtonState == LOW && lastMoveUpButtonState == HIGH) {
+  int moveUpButtonCurrState = digitalRead(DESK_UP_PIN);
+  if (moveUpButtonCurrState == LOW && moveUpButtonLastState == HIGH) {
     setMoveUp();
-    lastMoveUpButtonState = LOW;
-  } else if (currMoveUpButtonState == HIGH && lastMoveUpButtonState == LOW) {
+    moveUpButtonLastState = LOW;
+  } else if (moveUpButtonCurrState == HIGH && moveUpButtonLastState == LOW) {
     setStop();
-    lastMoveUpButtonState = HIGH;
+    moveUpButtonLastState = HIGH;
   }
 
-  int currMoveDownButtonState = digitalRead(DESK_DOWN_PIN);
-  if (currMoveDownButtonState == LOW && lastMoveDownButtonState == HIGH) {
+  int moveDownButtonCurrState = digitalRead(DESK_DOWN_PIN);
+  if (moveDownButtonCurrState == LOW && moveDownButtonLastState == HIGH) {
     setMoveDown();
-    lastMoveDownButtonState = LOW;
-  } else if (currMoveDownButtonState == HIGH && lastMoveDownButtonState == LOW) {
+    moveDownButtonLastState = LOW;
+  } else if (moveDownButtonCurrState == HIGH && moveDownButtonLastState == LOW) {
     setStop();
-    lastMoveDownButtonState = HIGH;
+    moveDownButtonLastState = HIGH;
   }
 }
 
 bool isWithinHeightBoundaries(int height) {
-  return height >= minDeskHeightInSteps && height <= maxDeskHeightInSteps;
+  return height >= minDeskHeight && height <= maxDeskHeight;
 }
 
 void setup() {
@@ -187,16 +198,14 @@ void setup() {
   pinMode(DIR_GROUND_PIN, INPUT_PULLDOWN);
   pinMode(STEP_PIN, OUTPUT);
   pinMode(PRESET_2_PIN, INPUT_PULLUP);
-  EEPROM.begin(EEPROM_SIZE);
-  // EEPROM.write(0, 0);
-  // EEPROM.commit();
-  currDeskHeightInSteps = fromNormalized(EEPROM.read(0));
+  currDeskHeight = readDeskHeight();
+  Serial.println((String)"Initial desk height: " + currDeskHeight);
 }
 
 void loop() {
   checkPresetButtonStates();
   checkMoveButtonStates();
-  if (enabled && isWithinHeightBoundaries(currDeskHeightInSteps + currMotionState)) {
+  if (enabled && isWithinHeightBoundaries(currDeskHeight + currMotionState)) {
     int currTimeMs = millis();
     if (prevTimeMs == -1) {
       prevTimeMs = currTimeMs;
@@ -210,8 +219,8 @@ void loop() {
     delayMicroseconds((int) (delayBasicMs * 1000));
     digitalWrite(STEP_PIN, LOW);
     delayMicroseconds((int) (currSpeedDelayMs * 1000));
-    currDeskHeightInSteps += currMotionState;
-  } else if (enabled && !isWithinHeightBoundaries(currDeskHeightInSteps + currMotionState)) {
+    currDeskHeight += currMotionState;
+  } else if (enabled && !isWithinHeightBoundaries(currDeskHeight + currMotionState)) {
     setStop();
   }
 }
