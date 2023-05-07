@@ -107,6 +107,11 @@ void setMoveDown() {
   currMotionState = MOTION_STATE_DOWN;
 }
 
+void resetAcceleration() {
+  currSpeedDelayMs = maxSpeedDelayMs;
+  prevLoopTimeMs = -1;
+}
+
 void setStop() {
   if (!enabled) { 
     return; 
@@ -114,8 +119,7 @@ void setStop() {
   Serial.println((String) "setStop at height: " + currDeskHeight);
   enabled = false;
   currMotionState = MOTION_STATE_DISABLED;
-  currSpeedDelayMs = maxSpeedDelayMs;
-  prevLoopTimeMs = -1;
+  resetAcceleration();
   storeDeskHeight(currDeskHeight);
   setDeskHeightBoundaries(0, MOTOR_MAX_STEPS);
 }
