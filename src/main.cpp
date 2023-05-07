@@ -43,8 +43,8 @@ int presetButtonPressedTimeMs = -1;
 
 Preferences preferences;
 
-void intToString(unsigned int preferencesKeyNumber, char* const preferencesKeyStr) {
-  sprintf(preferencesKeyStr, "%u", preferencesKeyNumber);
+void intToString(unsigned int number, char* const str) {
+  sprintf(str, "%u", number);
 }
 
 void storePreset(unsigned int presetNumber, unsigned int deskHeight) {
