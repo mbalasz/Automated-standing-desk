@@ -8,7 +8,7 @@
 #define PRESET_2_PIN 32
 
 #define DIR_PIN 19
-#define DIR_GROUND_PIN 18
+#define ENABLE_PIN 18
 #define STEP_PIN 4
 #define MOTION_STATE_UP 1
 #define MOTION_STATE_DOWN -1
@@ -92,6 +92,7 @@ void setMoveUp() {
     return; 
   }
   Serial.println("setMoveUp");
+  digitalWrite(ENABLE_PIN, LOW);
   digitalWrite(DIR_PIN, HIGH);
   enabled = true;
   currMotionState = MOTION_STATE_UP;
@@ -102,6 +103,7 @@ void setMoveDown() {
     return; 
   }
   Serial.println("setMoveDown");
+  digitalWrite(ENABLE_PIN, LOW);
   digitalWrite(DIR_PIN, LOW);
   enabled = true;
   currMotionState = MOTION_STATE_DOWN;
@@ -122,6 +124,9 @@ void setStop() {
   resetAcceleration();
   storeDeskHeight(currDeskHeight);
   setDeskHeightBoundaries(0, MOTOR_MAX_STEPS);
+  // Disable motor after a short delay to release torque more gracefully
+  delay(500);
+  digitalWrite(ENABLE_PIN, HIGH);
 }
 
 void setMoveToHeight(unsigned int height) {
@@ -170,22 +175,20 @@ void checkPresetButtonStates() {
 
 void checkMoveButtonStates() {
   int moveUpButtonCurrState = digitalRead(DESK_UP_PIN);
+  int moveDownButtonCurrState = digitalRead(DESK_DOWN_PIN);
   if (moveUpButtonCurrState == LOW && moveUpButtonLastState == HIGH) {
     setMoveUp();
-    moveUpButtonLastState = LOW;
   } else if (moveUpButtonCurrState == HIGH && moveUpButtonLastState == LOW) {
     setStop();
-    moveUpButtonLastState = HIGH;
   }
 
-  int moveDownButtonCurrState = digitalRead(DESK_DOWN_PIN);
   if (moveDownButtonCurrState == LOW && moveDownButtonLastState == HIGH) {
     setMoveDown();
-    moveDownButtonLastState = LOW;
   } else if (moveDownButtonCurrState == HIGH && moveDownButtonLastState == LOW) {
     setStop();
-    moveDownButtonLastState = HIGH;
   }
+  moveUpButtonLastState = moveUpButtonCurrState;
+  moveDownButtonLastState = moveDownButtonCurrState;
 }
 
 bool isWithinHeightBoundaries(int height) {
@@ -199,7 +202,7 @@ void setup() {
   pinMode(DESK_DOWN_GROUND_PIN, INPUT_PULLDOWN);
   pinMode(PRESET_1_PIN, INPUT_PULLUP);
   pinMode(DIR_PIN, OUTPUT);
-  pinMode(DIR_GROUND_PIN, INPUT_PULLDOWN);
+  pinMode(ENABLE_PIN, OUTPUT);
   pinMode(STEP_PIN, OUTPUT);
   pinMode(PRESET_2_PIN, INPUT_PULLUP);
   currDeskHeight = readDeskHeight();
