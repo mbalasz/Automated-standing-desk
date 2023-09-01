@@ -125,8 +125,10 @@ void setStop() {
   storeDeskHeight(currDeskHeight);
   setDeskHeightBoundaries(0, MOTOR_MAX_STEPS);
   // Disable motor after a short delay to release torque more gracefully
-  delay(500);
-  digitalWrite(ENABLE_PIN, HIGH);
+  // The power consumption when motor is disabled is 6W and where it has holding torque it's 9.5W.
+  // The savings are negligible and not holding the torque can lead to miscalibration of height over time.
+  // delay(500);
+  // digitalWrite(ENABLE_PIN, HIGH);
 }
 
 void setMoveToHeight(unsigned int height) {
@@ -195,6 +197,12 @@ bool isWithinHeightBoundaries(int height) {
   return height >= minDeskHeight && height <= maxDeskHeight;
 }
 
+// IMPORTANT: Only use this method as a one-off when desk height is miscalibrated.
+// After resetting the height, comment out all invocations and reupload the code.
+void resetDeskHeightToZero() {
+  storeDeskHeight(0);
+}
+
 void setup() {
   Serial.begin(9600);
   pinMode(DESK_UP_PIN, INPUT_PULLUP);
@@ -205,6 +213,7 @@ void setup() {
   pinMode(ENABLE_PIN, OUTPUT);
   pinMode(STEP_PIN, OUTPUT);
   pinMode(PRESET_2_PIN, INPUT_PULLUP);
+  // resetDeskHeightToZero();
   currDeskHeight = readDeskHeight();
   Serial.println((String)"Initial desk height: " + currDeskHeight);
 }
