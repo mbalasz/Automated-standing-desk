@@ -6,10 +6,12 @@
 #define DESK_DOWN_GROUND_PIN 26
 #define PRESET_1_PIN 25
 #define PRESET_2_PIN 32
-
 #define DIR_PIN 19
 #define ENABLE_PIN 18
 #define STEP_PIN 4
+#define DIST_SENSOR_TRIG_PIN 22
+#define DIST_SENSOR_ECHO_PIN 23
+
 #define MOTION_STATE_UP 1
 #define MOTION_STATE_DOWN -1
 #define MOTION_STATE_DISABLED 0
@@ -18,6 +20,10 @@
 #define DESK_PREFS_NAMESPACE "desk"
 #define DESK_PREFS_HEIGHT_KEY "height"
 
+#define DIST_IDLE 0
+#define DIST_TRIGGER_SENT 1
+#define DIST_TIMER_STARTED 2
+
 const double delayBasicMs = 0.1;
 unsigned int accelerationTimeMs = 1800;
 double maxSpeedDelayMs = 1.5;
@@ -25,6 +31,12 @@ double minSpeedDelayMs = 0.23;
 double currSpeedDelayMs = maxSpeedDelayMs;
 double delayDeltaPerMs = (maxSpeedDelayMs - minSpeedDelayMs) / accelerationTimeMs;
 int prevLoopTimeMs = -1;
+
+int distanceTriggerState = DIST_IDLE;
+long triggerSentTime = -1;
+float distanceAverage = -1;
+float alpha = 0.1;
+float maxDiff = 300;
 
 const unsigned int MOTOR_MAX_STEPS = 183000;
 bool enabled = false;
@@ -203,8 +215,38 @@ void resetDeskHeightToZero() {
   storeDeskHeight(0);
 }
 
+void updateAverageDistance(float distance) {
+  if (distanceAverage == -1) {
+    distanceAverage = distance;
+  } else {
+    int diff = abs(distance - distanceAverage);
+    if (diff <= maxDiff) {
+      distanceAverage = alpha * distance + (1 - alpha) * distanceAverage;
+    }
+  }
+}
+
+void checkEchoPin() {
+  if (digitalRead(DIST_SENSOR_ECHO_PIN) == LOW) {
+    long duration = micros() - triggerSentTime;
+    float distance = duration * 0.34 / 2;
+    float oldDistanceAverage = distanceAverage;
+    updateAverageDistance(distance);
+    distanceTriggerState = DIST_IDLE;
+  }
+}
+
+void sendDistanceTrigger() {
+  digitalWrite(DIST_SENSOR_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(DIST_SENSOR_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(DIST_SENSOR_TRIG_PIN, LOW);
+  distanceTriggerState = DIST_TRIGGER_SENT;
+}
+
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(921600);
   pinMode(DESK_UP_PIN, INPUT_PULLUP);
   pinMode(DESK_DOWN_PIN, INPUT_PULLUP);
   pinMode(DESK_DOWN_GROUND_PIN, INPUT_PULLDOWN);
@@ -213,6 +255,8 @@ void setup() {
   pinMode(ENABLE_PIN, OUTPUT);
   pinMode(STEP_PIN, OUTPUT);
   pinMode(PRESET_2_PIN, INPUT_PULLUP);
+  pinMode(DIST_SENSOR_ECHO_PIN, INPUT_PULLDOWN);
+  pinMode(DIST_SENSOR_TRIG_PIN, OUTPUT);
   // resetDeskHeightToZero();
   currDeskHeight = readDeskHeight();
   Serial.println((String)"Initial desk height: " + currDeskHeight);
@@ -221,6 +265,16 @@ void setup() {
 void loop() {
   checkPresetButtonStates();
   checkMoveButtonStates();
+  if (distanceTriggerState == DIST_IDLE) {
+    sendDistanceTrigger();
+  } else if (distanceTriggerState == DIST_TRIGGER_SENT) {
+    if (digitalRead(DIST_SENSOR_ECHO_PIN) == HIGH) {
+      triggerSentTime = micros();
+      distanceTriggerState = DIST_TIMER_STARTED;
+    }
+  } else if (distanceTriggerState == DIST_TIMER_STARTED) {
+    checkEchoPin();
+  }
   if (enabled && isWithinHeightBoundaries(currDeskHeight + currMotionState)) {
     int currTimeMs = millis();
     if (prevLoopTimeMs == -1) {
@@ -232,11 +286,20 @@ void loop() {
       prevLoopTimeMs = currTimeMs;
     }
     digitalWrite(STEP_PIN, HIGH);
-    delayMicroseconds((int) (delayBasicMs * 1000));
+    delayMicroseconds((int) (delayBasicMs * 1000)); // 100 microseconds
     digitalWrite(STEP_PIN, LOW);
-    delayMicroseconds((int) (currSpeedDelayMs * 1000));
+    int t = micros();
+    Serial.println(distanceAverage);
+    int t2 = micros() - t;
+    int delay = currSpeedDelayMs * 1000;
+    if (t2 < delay) {
+      delayMicroseconds(delay - t2);
+    }
+
+    // delayMicroseconds((int) (currSpeedDelayMs * 1000));
     currDeskHeight += currMotionState;
   } else if (enabled && !isWithinHeightBoundaries(currDeskHeight + currMotionState)) {
     setStop();
+  } else {
   }
 }
