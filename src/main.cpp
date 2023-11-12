@@ -27,7 +27,8 @@
 
 const double delayBasicMs = 0.1;
 unsigned int accelerationTimeMs = 1800;
-double maxSpeedDelayMs = 1.5;
+unsigned int decelerationSteps = 2200;
+double maxSpeedDelayMs = 2;
 double minSpeedDelayMs = 0.23;
 double currSpeedDelayMs = maxSpeedDelayMs;
 double delayDeltaPerMs = (maxSpeedDelayMs - minSpeedDelayMs) / accelerationTimeMs;
@@ -37,7 +38,7 @@ const unsigned int MOTOR_MAX_STEPS = 183000;
 bool enabled = false;
 unsigned int maxDeskHeight = MOTOR_MAX_STEPS;
 unsigned int minDeskHeight = 0;
-unsigned int currDeskHeight = 0;
+ int currDeskHeight = 0;
 int currMotionState = STOPPED;
 int currMotionDir = 0; // -1: moving down, 1: moving up, 0: not moving
 
@@ -95,9 +96,12 @@ void setDeskHeightBoundaries(unsigned int minHeight, unsigned int maxHeight) {
   maxDeskHeight = min(MOTOR_MAX_STEPS, maxHeight);
 }
 
+bool isWithinHeightBoundaries(int height) {
+  return height >= minDeskHeight && height <= maxDeskHeight;
+}
+
 void setMoveUp() {
-  if (currMotionState != STOPPED) { 
-  Serial.println(currMotionState);
+  if (currMotionState != STOPPED /*|| !isWithinHeightBoundaries(currDeskHeight + MOTION_STATE_UP * decelerationSteps)*/) { 
     return; 
   }
   Serial.println("setMoveUp");
@@ -112,7 +116,7 @@ void setMoveDown() {
   // if (enabled) { 
   //   return; 
   // }
-  if (currMotionState != STOPPED) { 
+  if (currMotionState != STOPPED /*|| !isWithinHeightBoundaries(currDeskHeight + MOTION_STATE_DOWN * decelerationSteps)*/) { 
     return; 
   }
   Serial.println("setMoveDown");
@@ -128,11 +132,28 @@ void resetAcceleration() {
   prevLoopTimeMs = -1;
 }
 
+void backtrack() {
+
+    Serial.println("Backtracking");
+    int backtrackSteps = currMotionDir == MOTION_STATE_DOWN ? 60 : 300;
+    currMotionDir *= -1;
+    digitalWrite(DIR_PIN, !digitalRead(DIR_PIN));
+    while(backtrackSteps-- > 0) {
+      digitalWrite(STEP_PIN, HIGH);
+      delayMicroseconds((int) (delayBasicMs * 1000)); // 100 microseconds
+      digitalWrite(STEP_PIN, LOW);
+      delayMicroseconds((int) (currSpeedDelayMs * 1000));
+      currDeskHeight += currMotionDir;
+    Serial.println(currDeskHeight);
+    }
+}
+
 void setStop() {
   if (currMotionState == STOPPED) { 
     return; 
   }
   Serial.println((String) "setStop at height: " + currDeskHeight);
+  backtrack();
   currMotionState = STOPPED;
   // enabled = false;
   currMotionDir = MOTION_STATE_DISABLED;
@@ -142,8 +163,8 @@ void setStop() {
   // Disable motor after a short delay to release torque more gracefully
   // The power consumption when motor is disabled is 6W and where it has holding torque it's 9.5W.
   // The savings are negligible and not holding the torque can lead to miscalibration of height over time.
-  // delay(500);
-  // digitalWrite(ENABLE_PIN, HIGH);
+  delay(500);
+  digitalWrite(ENABLE_PIN, HIGH);
 }
 
 void decelarate() {
@@ -151,7 +172,54 @@ void decelarate() {
     return;
   }
   Serial.println((String) "Started deceleration at height: " + currDeskHeight);
-  currMotionState = DECELERATING;
+
+  int stepsBeforeDecelerate = currDeskHeight;
+  while (isWithinHeightBoundaries(currDeskHeight + currMotionDir)) {
+      if (abs(stepsBeforeDecelerate - currDeskHeight) > decelerationSteps) {
+        break;
+      }
+      int currTimeMs = millis();
+      if (prevLoopTimeMs == -1) {
+        prevLoopTimeMs = currTimeMs;
+      } else if (currSpeedDelayMs < maxSpeedDelayMs) {
+        int elapsedTimeMs = currTimeMs - prevLoopTimeMs;
+        currSpeedDelayMs += delayDeltaPerMs * elapsedTimeMs;
+        currSpeedDelayMs = min(currSpeedDelayMs, maxSpeedDelayMs);
+        prevLoopTimeMs = currTimeMs;
+      } else {
+      }
+
+    digitalWrite(STEP_PIN, HIGH);
+    delayMicroseconds((int) (delayBasicMs * 1000)); // 100 microseconds
+    digitalWrite(STEP_PIN, LOW);
+    delayMicroseconds((int) (currSpeedDelayMs * 1000));
+    currDeskHeight += currMotionDir;
+    Serial.println(currDeskHeight);
+  }
+  if (currMotionState  != STOPPED /*&& currMotionDir == MOTION_STATE_UP*/) {
+    // Only backtrack when we were previously at full speed. Otherwise, there are bugs where 
+    // short presses of move buttons result in backtracks larger than the actual move.
+    // Once we enter the RUNNING state, we know we're past the ACCELERATION state, so we had
+    // already moved in one direction more steps than the backtrack.
+    bool extra = false;
+    if (currMotionDir == MOTION_STATE_DOWN) {
+      extra = true;
+
+    }
+    if (extra) {
+      // digitalWrite(DIR_PIN, !digitalRead(DIR_PIN));
+      //  backtrackSteps = 300;
+      // while(backtrackSteps-- > 0) {
+      //   digitalWrite(STEP_PIN, HIGH);
+      //   delayMicroseconds((int) (delayBasicMs * 1000)); // 100 microseconds
+      //   digitalWrite(STEP_PIN, LOW);
+      //   delayMicroseconds((int) (currSpeedDelayMs * 1000));
+      //   currDeskHeight += currMotionDir;
+      // }
+    }
+
+  }
+  setStop();
 }
 
 void setMoveToHeight(unsigned int height) {
@@ -218,10 +286,6 @@ void checkMoveButtonStates() {
   moveDownButtonLastState = moveDownButtonCurrState;
 }
 
-bool isWithinHeightBoundaries(int height) {
-  return height >= minDeskHeight && height <= maxDeskHeight;
-}
-
 // IMPORTANT: Only use this method as a one-off when desk height is miscalibrated.
 // After resetting the height, comment out all invocations and reupload the code.
 void resetDeskHeightToZero() {
@@ -241,7 +305,7 @@ void setup() {
   pinMode(PRESET_2_PIN, INPUT_PULLUP);
   pinMode(DIST_SENSOR_ECHO_PIN, INPUT_PULLDOWN);
   pinMode(DIST_SENSOR_TRIG_PIN, OUTPUT);
-  // resetDeskHeightToZero();
+  resetDeskHeightToZero();
   currDeskHeight = readDeskHeight();
   Serial.println((String)"Initial desk height: " + currDeskHeight);
 }
@@ -249,13 +313,13 @@ void setup() {
 void loop() {
   checkPresetButtonStates();
   checkMoveButtonStates();
-  if (currMotionState != STOPPED 
-      && currMotionState != DECELERATING 
-      && !isWithinHeightBoundaries(currDeskHeight + (currMotionDir*2200))) {
+  if (currMotionState == RUNNING 
+      && !isWithinHeightBoundaries(currDeskHeight + (currMotionDir*decelerationSteps))) {
+        Serial.println("YES");
     decelarate();
     // setStop();
   } else if (currMotionState != STOPPED && isWithinHeightBoundaries(currDeskHeight + currMotionDir)) {
-    if (currMotionState == ACCELERATING) {
+    if (currMotionState == ACCELERATING && isWithinHeightBoundaries(currDeskHeight + (currMotionDir*decelerationSteps))) {
       int currTimeMs = millis();
       if (prevLoopTimeMs == -1) {
         prevLoopTimeMs = currTimeMs;
@@ -269,23 +333,13 @@ void loop() {
         currMotionState = RUNNING;
       }
     } else if (currMotionState == DECELERATING) {
-      int currTimeMs = millis();
-      if (prevLoopTimeMs == -1) {
-        prevLoopTimeMs = currTimeMs;
-      } else if (currSpeedDelayMs < maxSpeedDelayMs) {
-        int elapsedTimeMs = currTimeMs - prevLoopTimeMs;
-        currSpeedDelayMs += delayDeltaPerMs * elapsedTimeMs;
-        currSpeedDelayMs = min(currSpeedDelayMs, maxSpeedDelayMs);
-        prevLoopTimeMs = currTimeMs;
-      } else {
-        setStop();
-      }
     }
     digitalWrite(STEP_PIN, HIGH);
     delayMicroseconds((int) (delayBasicMs * 1000)); // 100 microseconds
     digitalWrite(STEP_PIN, LOW);
     delayMicroseconds((int) (currSpeedDelayMs * 1000));
     currDeskHeight += currMotionDir;
+    Serial.println(currDeskHeight);
   } else {
     setStop();
   }
