@@ -199,7 +199,7 @@ void decelarate() {
     } 
     makeStep();
   }
-  setStop();
+  currMotionState = DECELERATING;
 }
 
 void setMoveToHeight(unsigned int height) {
@@ -253,12 +253,14 @@ void checkMoveButtonStates() {
     setMoveUp();
   } else if (moveUpButtonCurrState == HIGH && moveUpButtonLastState == LOW) {
     decelarate();
+    setStop();
   }
 
   if (moveDownButtonCurrState == LOW && moveDownButtonLastState == HIGH) {
     setMoveDown();
   } else if (moveDownButtonCurrState == HIGH && moveDownButtonLastState == LOW) {
     decelarate();
+    setStop();
   }
   moveUpButtonLastState = moveUpButtonCurrState;
   moveDownButtonLastState = moveDownButtonCurrState;
@@ -292,7 +294,7 @@ void loop() {
   checkPresetButtonStates();
   checkMoveButtonStates();
   if (currMotionState == RUNNING 
-      && !isWithinHeightBoundaries(currDeskHeight + (currMotionDir*accelerationSteps))) {
+      && !isWithinHeightBoundaries(currDeskHeight + (currMotionDir*accelerationSteps * 2))) {
     decelarate();
   } else if (currMotionState != STOPPED 
              && isWithinHeightBoundaries(currDeskHeight + currMotionDir)) {
@@ -309,7 +311,7 @@ void loop() {
       }
     }
     makeStep();
-  } else {
+  } else if (currMotionState != STOPPED) {
     // This will trigger when we started moving the desk within the boundaries and it reached its limit.
     // currMotionState will be ACCELERATING. We want to setStop() to trigger backtrack.
     setStop();
