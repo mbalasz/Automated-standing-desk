@@ -52,6 +52,7 @@
 const double stepDelayMs = 0.1;
 unsigned int accelerationSteps = 2200;
 unsigned int currAccelerationSteps = 0;
+unsigned int currDecelerationSteps = 0;
 const unsigned int BACKTRACK_STEPS_AFTER_GOING_UP = 300;
 const unsigned int BACKTRACK_STEPS_AFTER_GOING_DOWN = 60;
 double maxSpeedDelayMs = 2;
@@ -197,6 +198,18 @@ void resetAcceleration() {
   currSpeedDelayMs = maxSpeedDelayMs;
   prevLoopTimeMs = -1;
   currAccelerationSteps = 0;
+  currDecelerationSteps = 0;
+}
+
+void startDeceleration() {
+  Serial.println((String)"Started deceleration at height: " + currDeskHeight);
+  currDecelerationSteps = 0;
+  prevLoopTimeMs = -1;
+  currMotionState = DECELERATING;
+}
+
+bool approachingBoundary() {
+  return !isWithinHeightBoundaries(currDeskHeight + currMotionDir * (int)(accelerationSteps * 2));
 }
 
 void makeStep() {
@@ -241,36 +254,31 @@ void setStop() {
   digitalWrite(ENABLE_PIN_2, HIGH);
 }
 
-void changeAcceleration(int direction) {
+void rampSpeedUp() {
   int currTimeMs = millis();
-  int elapsedTimeMs = currTimeMs - prevLoopTimeMs;
-  currSpeedDelayMs -= (direction * delayDeltaPerMs * elapsedTimeMs);
-  if (direction == -1) {
-    currSpeedDelayMs = min(currSpeedDelayMs, maxSpeedDelayMs);
-  } else {
-    currSpeedDelayMs = max(currSpeedDelayMs, minSpeedDelayMs);
-  }
+  currSpeedDelayMs -= delayDeltaPerMs * (currTimeMs - prevLoopTimeMs);
+  currSpeedDelayMs = max(currSpeedDelayMs, minSpeedDelayMs);
   prevLoopTimeMs = currTimeMs;
 }
 
-void decelarate() {
-  if (currMotionState == STOPPED) {
-    return;
-  }
-  Serial.println((String)"Started deceleration at height: " + currDeskHeight);
+void rampSpeedDown() {
+  int currTimeMs = millis();
+  currSpeedDelayMs += delayDeltaPerMs * (currTimeMs - prevLoopTimeMs);
+  currSpeedDelayMs = min(currSpeedDelayMs, maxSpeedDelayMs);
+  prevLoopTimeMs = currTimeMs;
+}
 
-  int currDecelerationSteps = 0;
-  prevLoopTimeMs = -1;
-  while (currDecelerationSteps++ < (int)currAccelerationSteps
-         && isWithinHeightBoundaries(currDeskHeight + currMotionDir)) {
-    if (prevLoopTimeMs == -1) {
-      prevLoopTimeMs = millis();
-    } else if (currSpeedDelayMs < maxSpeedDelayMs) {
-      changeAcceleration(-1);
-    }
-    makeStep();
-  }
-  currMotionState = DECELERATING;
+void handleEmergencyStop() {
+  Serial.println("STALL DETECTED — emergency stop");
+  motor1Stalled = false;
+  motor2Stalled = false;
+  currMotionState = STOPPED;
+  currMotionDir = MOTION_STATE_DISABLED;
+  resetAcceleration();
+  storeDeskHeight(currDeskHeight);
+  setDeskHeightBoundaries(0, MOTOR_MAX_STEPS);
+  digitalWrite(ENABLE_PIN_1, HIGH);
+  digitalWrite(ENABLE_PIN_2, HIGH);
 }
 
 void setMoveToHeight(unsigned int height) {
@@ -458,15 +466,13 @@ void checkMoveButtonStates() {
   if (moveUpButtonCurrState == LOW && moveUpButtonLastState == HIGH) {
     setMoveUp();
   } else if (moveUpButtonCurrState == HIGH && moveUpButtonLastState == LOW) {
-    decelarate();
-    setStop();
+    startDeceleration();
   }
 
   if (moveDownButtonCurrState == LOW && moveDownButtonLastState == HIGH) {
     setMoveDown();
   } else if (moveDownButtonCurrState == HIGH && moveDownButtonLastState == LOW) {
-    decelarate();
-    setStop();
+    startDeceleration();
   }
   moveUpButtonLastState = moveUpButtonCurrState;
   moveDownButtonLastState = moveDownButtonCurrState;
@@ -519,45 +525,50 @@ void setup() {
 }
 
 void loop() {
-  // ── Unexpected stall guard ────────────────────────────────────────────────
-  // If a DIAG interrupt fired during normal motion, stop both motors immediately.
-  // Do NOT backtrack — desk may be jammed. Re-home after an unexpected stall.
-  if ((motor1Stalled || motor2Stalled) && currMotionState != STOPPED) {
-    Serial.println("STALL DETECTED — emergency stop");
-    motor1Stalled = false;
-    motor2Stalled = false;
-    currMotionState = STOPPED;
-    currMotionDir = MOTION_STATE_DISABLED;
-    resetAcceleration();
-    storeDeskHeight(currDeskHeight);
-    setDeskHeightBoundaries(0, MOTOR_MAX_STEPS);
-    digitalWrite(ENABLE_PIN_1, HIGH);
-    digitalWrite(ENABLE_PIN_2, HIGH);
+  if (motor1Stalled || motor2Stalled) {
+    handleEmergencyStop();
     return;
   }
 
   checkPresetButtonStates();
   checkMoveButtonStates();
 
-  if (currMotionState == RUNNING
-      && !isWithinHeightBoundaries(currDeskHeight + (currMotionDir * accelerationSteps * 2))) {
-    decelarate();
-  } else if (currMotionState != STOPPED
-             && isWithinHeightBoundaries(currDeskHeight + currMotionDir)) {
-    if (currMotionState == ACCELERATING
-        && isWithinHeightBoundaries(currDeskHeight + (currMotionDir * accelerationSteps))) {
-      // Don't accelerate when close to the boundaries.
+  if (currMotionState == STOPPED) return;
+
+  if (currMotionState == RUNNING && approachingBoundary()) {
+    startDeceleration();
+  }
+
+  if (!isWithinHeightBoundaries(currDeskHeight + currMotionDir)) {
+    setStop();
+    return;
+  }
+
+  switch (currMotionState) {
+    case ACCELERATING:
       if (prevLoopTimeMs == -1) {
         prevLoopTimeMs = millis();
-      } else if (currAccelerationSteps < accelerationSteps) {
-        changeAcceleration(1);
+      } else if (currAccelerationSteps < accelerationSteps
+                 && isWithinHeightBoundaries(currDeskHeight + currMotionDir * (int)accelerationSteps)) {
+        rampSpeedUp();
         currAccelerationSteps++;
       } else {
         currMotionState = RUNNING;
       }
-    }
-    makeStep();
-  } else if (currMotionState != STOPPED) {
-    setStop();
+      break;
+
+    case DECELERATING:
+      if (prevLoopTimeMs == -1) {
+        prevLoopTimeMs = millis();
+      } else if (currDecelerationSteps < currAccelerationSteps) {
+        rampSpeedDown();
+        currDecelerationSteps++;
+      } else {
+        setStop();
+        return;
+      }
+      break;
   }
+
+  makeStep();
 }
