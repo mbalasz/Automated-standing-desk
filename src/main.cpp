@@ -236,12 +236,10 @@ void backtrack() {
   }
 }
 
-void setStop() {
-  if (currMotionState == STOPPED) {
-    return;
-  }
+void setStop(bool doBacktrack = true) {
+  if (currMotionState == STOPPED) return;
   Serial.println((String)"setStop at height: " + currDeskHeight);
-  backtrack();
+  if (doBacktrack) backtrack();
   currMotionState = STOPPED;
   currMotionDir = MOTION_STATE_DISABLED;
   resetAcceleration();
@@ -266,13 +264,7 @@ void handleEmergencyStop() {
   Serial.println("STALL DETECTED — emergency stop");
   motor1Stalled = false;
   motor2Stalled = false;
-  currMotionState = STOPPED;
-  currMotionDir = MOTION_STATE_DISABLED;
-  resetAcceleration();
-  storeDeskHeight(currDeskHeight);
-  setDeskHeightBoundaries(0, MOTOR_MAX_STEPS);
-  digitalWrite(ENABLE_PIN_1, HIGH);
-  digitalWrite(ENABLE_PIN_2, HIGH);
+  setStop(false);
 }
 
 void setMoveToHeight(unsigned int height) {
