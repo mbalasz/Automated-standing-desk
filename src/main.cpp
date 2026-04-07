@@ -162,6 +162,11 @@ void setDirDown() {
   digitalWrite(DIR_PIN_2, LOW);
 }
 
+void setMotorsEnabled(bool enabled) {
+  digitalWrite(ENABLE_PIN_1, enabled ? LOW : HIGH);
+  digitalWrite(ENABLE_PIN_2, enabled ? LOW : HIGH);
+}
+
 // ── Motion control ────────────────────────────────────────────────────────────
 
 void setMoveUp() {
@@ -172,8 +177,7 @@ void setMoveUp() {
   Serial.println("setMoveUp");
   motor1Stalled = false;
   motor2Stalled = false;
-  digitalWrite(ENABLE_PIN_1, LOW);
-  digitalWrite(ENABLE_PIN_2, LOW);
+  setMotorsEnabled(true);
   setDirUp();
   currMotionState = ACCELERATING;
   currMotionDir = MOTION_STATE_UP;
@@ -187,8 +191,7 @@ void setMoveDown() {
   Serial.println("setMoveDown");
   motor1Stalled = false;
   motor2Stalled = false;
-  digitalWrite(ENABLE_PIN_1, LOW);
-  digitalWrite(ENABLE_PIN_2, LOW);
+  setMotorsEnabled(true);
   setDirDown();
   currMotionState = ACCELERATING;
   currMotionDir = MOTION_STATE_DOWN;
@@ -246,8 +249,7 @@ void setStop(bool doBacktrack = true) {
   storeDeskHeight(currDeskHeight);
   setDeskHeightBoundaries(0, MOTOR_MAX_STEPS);
   delay(500);
-  digitalWrite(ENABLE_PIN_1, HIGH);
-  digitalWrite(ENABLE_PIN_2, HIGH);
+  setMotorsEnabled(false);
 }
 
 void rampSpeedUp(int deltaTime) {
@@ -299,24 +301,21 @@ void performHoming() {
   motor1HomingDone = false;
   motor2HomingDone = false;
 
-  digitalWrite(ENABLE_PIN_1, LOW);
-  digitalWrite(ENABLE_PIN_2, LOW);
+  setMotorsEnabled(true);
   setDirDown();
 
   unsigned long start = millis();
   while (!motor1HomingDone || !motor2HomingDone) {
     if (millis() - start > HOMING_TIMEOUT_MS) {
       Serial.println("Homing: TIMEOUT — check SGTHRS or wiring. Height NOT reset.");
-      digitalWrite(ENABLE_PIN_1, HIGH);
-      digitalWrite(ENABLE_PIN_2, HIGH);
+      setMotorsEnabled(false);
       homingInProgress = false;
       return;
     }
     makeHomingStep();
   }
 
-  digitalWrite(ENABLE_PIN_1, HIGH);
-  digitalWrite(ENABLE_PIN_2, HIGH);
+  setMotorsEnabled(false);
   homingInProgress = false;
   currDeskHeight = 0;
   currMotionState = STOPPED;
@@ -476,14 +475,14 @@ void setup() {
   // Motor 1
   pinMode(DIR_PIN_1, OUTPUT);
   pinMode(ENABLE_PIN_1, OUTPUT);
-  digitalWrite(ENABLE_PIN_1, HIGH); // disabled at boot
   pinMode(STEP_PIN_1, OUTPUT);
 
   // Motor 2
   pinMode(DIR_PIN_2, OUTPUT);
   pinMode(ENABLE_PIN_2, OUTPUT);
-  digitalWrite(ENABLE_PIN_2, HIGH); // disabled at boot
   pinMode(STEP_PIN_2, OUTPUT);
+
+  setMotorsEnabled(false);
 
   // DIAG pins (interrupt-driven stall detection)
   pinMode(DIAG_PIN_1, INPUT);
