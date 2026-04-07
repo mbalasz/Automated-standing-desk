@@ -170,6 +170,7 @@ void setMotorsEnabled(bool enabled) {
 // ── Motion control ────────────────────────────────────────────────────────────
 
 void setMoveUp() {
+  // Require more headroom than the post-stop backtrack, so the desk ends up higher than it started.
   if (currMotionState != STOPPED
       || !isWithinHeightBoundaries(currDeskHeight + MOTION_STATE_UP * (BACKTRACK_STEPS_AFTER_GOING_UP + 1))) {
     return;
@@ -184,6 +185,7 @@ void setMoveUp() {
 }
 
 void setMoveDown() {
+  // Require more clearance than the post-stop backtrack, so the desk ends up lower than it started.
   if (currMotionState != STOPPED
       || !isWithinHeightBoundaries(currDeskHeight + MOTION_STATE_DOWN * (BACKTRACK_STEPS_AFTER_GOING_DOWN + 1))) {
     return;
