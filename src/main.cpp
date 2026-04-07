@@ -300,6 +300,7 @@ void makeHomingStep() {
 void performHoming() {
   Serial.println("Homing: starting — both motors driving down at slow speed");
   homingInProgress = true;
+  currMotionState = RUNNING; 
   motor1HomingDone = false;
   motor2HomingDone = false;
 
@@ -317,13 +318,9 @@ void performHoming() {
     makeHomingStep();
   }
 
-  setMotorsEnabled(false);
   homingInProgress = false;
   currDeskHeight = 0;
-  currMotionState = STOPPED;
-  currMotionDir = MOTION_STATE_DISABLED;
-  resetAcceleration();
-  storeDeskHeight(0);
+  setStop(false);
   Serial.println("Homing: done, height = 0");
 }
 
