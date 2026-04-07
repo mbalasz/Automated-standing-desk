@@ -1,14 +1,38 @@
 #include <Arduino.h>
 #include <Preferences.h>
+#include <TMCStepper.h>
+
+// ── Motor 1 (left leg) ───────────────────────────────────────────────────────
+#define DIR_PIN_1    19
+#define ENABLE_PIN_1 18
+#define STEP_PIN_1    4
+#define DIAG_PIN_1   34   // input-only GPIO
+
+// ── Motor 2 (right leg) ──────────────────────────────────────────────────────
+#define DIR_PIN_2    33
+#define ENABLE_PIN_2 27
+#define STEP_PIN_2    5
+#define DIAG_PIN_2   35   // input-only GPIO
+
+// ── TMC2209 UART (Serial2) ────────────────────────────────────────────────────
+#define TMC_SERIAL_RX_PIN 16
+#define TMC_SERIAL_TX_PIN 17
+#define TMC_UART_BAUD     115200
+
+// ── Motor 2 direction inversion ───────────────────────────────────────────────
+// Motors are mounted mirrored (shafts face outward). Toggle to 0 if one leg
+// moves the wrong way — the driver inverts internally via shaft(true).
+#define MOTOR_2_DIR_INVERTED 1
+
+// ── TMC2209 UART addresses (set by MS1/MS2 pins on each driver board) ─────────
+#define TMC_ADDR_MOTOR_1  0   // MS1=LOW,  MS2=LOW
+#define TMC_ADDR_MOTOR_2  1   // MS1=HIGH, MS2=LOW
 
 #define DESK_UP_PIN 14
 #define DESK_UP_GROUND_PIN 26
 #define DESK_DOWN_PIN 12
 #define PRESET_1_PIN 25
 #define PRESET_2_PIN 32
-#define DIR_PIN 19
-#define ENABLE_PIN 18
-#define STEP_PIN 4
 #define DIST_SENSOR_TRIG_PIN 22
 #define DIST_SENSOR_ECHO_PIN 23
 
@@ -33,26 +57,45 @@ const unsigned int BACKTRACK_STEPS_AFTER_GOING_DOWN = 60;
 double maxSpeedDelayMs = 2;
 double minSpeedDelayMs = 0.23;
 double currSpeedDelayMs = maxSpeedDelayMs;
-double delayDeltaPerMs = (maxSpeedDelayMs-minSpeedDelayMs) / accelerationSteps;
+double delayDeltaPerMs = (maxSpeedDelayMs - minSpeedDelayMs) / accelerationSteps;
 int prevLoopTimeMs = -1;
 
 const unsigned int MOTOR_MAX_STEPS = 183000;
-bool enabled = false;
 unsigned int maxDeskHeight = MOTOR_MAX_STEPS;
 unsigned int minDeskHeight = 0;
- int currDeskHeight = 0;
+int currDeskHeight = 0;
 int currMotionState = STOPPED;
 int currMotionDir = 0; // -1: moving down, 1: moving up, 0: not moving
 
+// ── Homing constants ─────────────────────────────────────────────────────────
+const double HOMING_SPEED_DELAY_MS = 1.5;
+const unsigned int HOMING_TIMEOUT_MS = 30000; // 30s safety cutoff
+
+// ── Stall / homing state (written from ISRs — must be volatile) ───────────────
+volatile bool motor1Stalled = false;
+volatile bool motor2Stalled = false;
+volatile bool homingInProgress = false;
+volatile bool motor1HomingDone = false;
+volatile bool motor2HomingDone = false;
+
+// ── Button state ─────────────────────────────────────────────────────────────
 int moveUpButtonLastState = HIGH;
 int moveDownButtonLastState = HIGH;
 
 const int PRESET_BUTTONS_PINS[] = {32, 25};
 int presetButtonStates[] = {HIGH, HIGH};
-int presetButtonLastState = HIGH;
 int presetButtonPressedTimeMs = -1;
 
+unsigned long bothPresetsPressedSince = 0;
+bool homingTriggered = false;
+
+// ── TMC2209 driver objects ────────────────────────────────────────────────────
+TMC2209Stepper driver1(&Serial2, 0.11f, TMC_ADDR_MOTOR_1);
+TMC2209Stepper driver2(&Serial2, 0.11f, TMC_ADDR_MOTOR_2);
+
 Preferences preferences;
+
+// ── Preference helpers ────────────────────────────────────────────────────────
 
 void intToString(unsigned int number, char* const str) {
   sprintf(str, "%u", number);
@@ -92,6 +135,8 @@ unsigned int readDeskHeight() {
   return height;
 }
 
+// ── Height boundaries ─────────────────────────────────────────────────────────
+
 void setDeskHeightBoundaries(unsigned int minHeight, unsigned int maxHeight) {
   Serial.println((String)"Setting desk height boundaries to: (" + minHeight + "," + maxHeight + ")");
   minDeskHeight = max(0U, minHeight);
@@ -99,29 +144,51 @@ void setDeskHeightBoundaries(unsigned int minHeight, unsigned int maxHeight) {
 }
 
 bool isWithinHeightBoundaries(int height) {
-  return height >= minDeskHeight && height <= maxDeskHeight;
+  return height >= (int)minDeskHeight && height <= (int)maxDeskHeight;
 }
 
+// ── DIR helpers ───────────────────────────────────────────────────────────────
+// Motor 2 direction is inverted at the driver level via driver2.shaft(true),
+// so both DIR pins always receive the same logical signal.
+
+void setDirUp() {
+  digitalWrite(DIR_PIN_1, HIGH);
+  digitalWrite(DIR_PIN_2, HIGH);
+}
+
+void setDirDown() {
+  digitalWrite(DIR_PIN_1, LOW);
+  digitalWrite(DIR_PIN_2, LOW);
+}
+
+// ── Motion control ────────────────────────────────────────────────────────────
+
 void setMoveUp() {
-  if (currMotionState != STOPPED 
-      || !isWithinHeightBoundaries(currDeskHeight + MOTION_STATE_UP * (BACKTRACK_STEPS_AFTER_GOING_UP + 1))) { 
-    return; 
+  if (currMotionState != STOPPED
+      || !isWithinHeightBoundaries(currDeskHeight + MOTION_STATE_UP * (BACKTRACK_STEPS_AFTER_GOING_UP + 1))) {
+    return;
   }
   Serial.println("setMoveUp");
-  digitalWrite(ENABLE_PIN, LOW);
-  digitalWrite(DIR_PIN, HIGH);
+  motor1Stalled = false;
+  motor2Stalled = false;
+  digitalWrite(ENABLE_PIN_1, LOW);
+  digitalWrite(ENABLE_PIN_2, LOW);
+  setDirUp();
   currMotionState = ACCELERATING;
   currMotionDir = MOTION_STATE_UP;
 }
 
 void setMoveDown() {
-  if (currMotionState != STOPPED 
-      || !isWithinHeightBoundaries(currDeskHeight + MOTION_STATE_DOWN * (BACKTRACK_STEPS_AFTER_GOING_DOWN + 1))) { 
-    return; 
+  if (currMotionState != STOPPED
+      || !isWithinHeightBoundaries(currDeskHeight + MOTION_STATE_DOWN * (BACKTRACK_STEPS_AFTER_GOING_DOWN + 1))) {
+    return;
   }
   Serial.println("setMoveDown");
-  digitalWrite(ENABLE_PIN, LOW);
-  digitalWrite(DIR_PIN, LOW);
+  motor1Stalled = false;
+  motor2Stalled = false;
+  digitalWrite(ENABLE_PIN_1, LOW);
+  digitalWrite(ENABLE_PIN_2, LOW);
+  setDirDown();
   currMotionState = ACCELERATING;
   currMotionDir = MOTION_STATE_DOWN;
 }
@@ -133,41 +200,45 @@ void resetAcceleration() {
 }
 
 void makeStep() {
-  digitalWrite(STEP_PIN, HIGH);
-  delayMicroseconds((int) (stepDelayMs * 1000)); // 100 microseconds
-  digitalWrite(STEP_PIN, LOW);
-  delayMicroseconds((int) (currSpeedDelayMs * 1000));
+  digitalWrite(STEP_PIN_1, HIGH);
+  digitalWrite(STEP_PIN_2, HIGH);
+  delayMicroseconds((int)(stepDelayMs * 1000)); // 100 µs pulse
+  digitalWrite(STEP_PIN_1, LOW);
+  digitalWrite(STEP_PIN_2, LOW);
+  delayMicroseconds((int)(currSpeedDelayMs * 1000));
   currDeskHeight += currMotionDir;
 }
 
 void backtrack() {
   Serial.println("Backtracking");
-  int backtrackSteps = currMotionDir == MOTION_STATE_DOWN 
-    ? BACKTRACK_STEPS_AFTER_GOING_DOWN 
+  int backtrackSteps = currMotionDir == MOTION_STATE_DOWN
+    ? BACKTRACK_STEPS_AFTER_GOING_DOWN
     : BACKTRACK_STEPS_AFTER_GOING_UP;
   currMotionDir *= -1;
-  digitalWrite(DIR_PIN, !digitalRead(DIR_PIN));
-  while(backtrackSteps-- > 0) {
+  if (currMotionDir == MOTION_STATE_UP) {
+    setDirUp();
+  } else {
+    setDirDown();
+  }
+  while (backtrackSteps-- > 0) {
     makeStep();
   }
 }
 
 void setStop() {
-  if (currMotionState == STOPPED) { 
-    return; 
+  if (currMotionState == STOPPED) {
+    return;
   }
-  Serial.println((String) "setStop at height: " + currDeskHeight);
+  Serial.println((String)"setStop at height: " + currDeskHeight);
   backtrack();
   currMotionState = STOPPED;
   currMotionDir = MOTION_STATE_DISABLED;
   resetAcceleration();
   storeDeskHeight(currDeskHeight);
   setDeskHeightBoundaries(0, MOTOR_MAX_STEPS);
-  // Disable motor after a short delay to release torque more gracefully
-  // The power consumption when motor is disabled is 6W and where it has holding torque it's 9.5W.
-  // The savings are negligible and not holding the torque can lead to miscalibration of height over time.
   delay(500);
-  digitalWrite(ENABLE_PIN, HIGH);
+  digitalWrite(ENABLE_PIN_1, HIGH);
+  digitalWrite(ENABLE_PIN_2, HIGH);
 }
 
 void changeAcceleration(int direction) {
@@ -186,17 +257,17 @@ void decelarate() {
   if (currMotionState == STOPPED) {
     return;
   }
-  Serial.println((String) "Started deceleration at height: " + currDeskHeight);
+  Serial.println((String)"Started deceleration at height: " + currDeskHeight);
 
   int currDecelerationSteps = 0;
   prevLoopTimeMs = -1;
-  while (currDecelerationSteps++ < currAccelerationSteps 
+  while (currDecelerationSteps++ < (int)currAccelerationSteps
          && isWithinHeightBoundaries(currDeskHeight + currMotionDir)) {
     if (prevLoopTimeMs == -1) {
       prevLoopTimeMs = millis();
     } else if (currSpeedDelayMs < maxSpeedDelayMs) {
       changeAcceleration(-1);
-    } 
+    }
     makeStep();
   }
   currMotionState = DECELERATING;
@@ -204,11 +275,10 @@ void decelarate() {
 
 void setMoveToHeight(unsigned int height) {
   if (currMotionState != STOPPED) {
-    // Ignore new actions when the desk is already moving.
     return;
   }
-  Serial.println((String) "Moving to height: " + height);
-  if (currDeskHeight > height) {
+  Serial.println((String)"Moving to height: " + height);
+  if (currDeskHeight > (int)height) {
     setDeskHeightBoundaries(height, MOTOR_MAX_STEPS);
     setMoveDown();
   } else {
@@ -217,10 +287,124 @@ void setMoveToHeight(unsigned int height) {
   }
 }
 
+// ── Homing ────────────────────────────────────────────────────────────────────
+
+// Steps only the motors that have not yet stalled. No height tracking.
+void makeHomingStep() {
+  if (!motor1HomingDone) { digitalWrite(STEP_PIN_1, HIGH); }
+  if (!motor2HomingDone) { digitalWrite(STEP_PIN_2, HIGH); }
+  delayMicroseconds((int)(stepDelayMs * 1000));
+  if (!motor1HomingDone) { digitalWrite(STEP_PIN_1, LOW); }
+  if (!motor2HomingDone) { digitalWrite(STEP_PIN_2, LOW); }
+  delayMicroseconds((int)(HOMING_SPEED_DELAY_MS * 1000));
+}
+
+void performHoming() {
+  Serial.println("Homing: starting — both motors driving down at slow speed");
+  homingInProgress = true;
+  motor1HomingDone = false;
+  motor2HomingDone = false;
+
+  digitalWrite(ENABLE_PIN_1, LOW);
+  digitalWrite(ENABLE_PIN_2, LOW);
+  setDirDown();
+
+  unsigned long start = millis();
+  while (!motor1HomingDone || !motor2HomingDone) {
+    if (millis() - start > HOMING_TIMEOUT_MS) {
+      Serial.println("Homing: TIMEOUT — check SGTHRS or wiring. Height NOT reset.");
+      digitalWrite(ENABLE_PIN_1, HIGH);
+      digitalWrite(ENABLE_PIN_2, HIGH);
+      homingInProgress = false;
+      return;
+    }
+    makeHomingStep();
+  }
+
+  digitalWrite(ENABLE_PIN_1, HIGH);
+  digitalWrite(ENABLE_PIN_2, HIGH);
+  homingInProgress = false;
+  currDeskHeight = 0;
+  currMotionState = STOPPED;
+  currMotionDir = MOTION_STATE_DISABLED;
+  resetAcceleration();
+  storeDeskHeight(0);
+  Serial.println("Homing: done, height = 0");
+}
+
+// ── DIAG ISR handlers ─────────────────────────────────────────────────────────
+
+void IRAM_ATTR onMotor1Stall() {
+  if (homingInProgress) {
+    motor1HomingDone = true;
+  } else {
+    // In normal operation both motors must stop together to keep the desk level.
+    motor1Stalled = true;
+    motor2Stalled = true;
+  }
+}
+
+void IRAM_ATTR onMotor2Stall() {
+  if (homingInProgress) {
+    motor2HomingDone = true;
+  } else {
+    motor1Stalled = true;
+    motor2Stalled = true;
+  }
+}
+
+// ── TMC2209 initialization ────────────────────────────────────────────────────
+
+void initDrivers() {
+  Serial2.begin(TMC_UART_BAUD, SERIAL_8N1, TMC_SERIAL_RX_PIN, TMC_SERIAL_TX_PIN);
+  delay(100);
+
+  driver1.begin();
+  driver2.begin();
+
+  // RMS current in mA. Adjust to your motor spec.
+  // 600 mA is conservative for NEMA 17 — increase if motors skip steps.
+  driver1.rms_current(600);
+  driver2.rms_current(600);
+
+  driver1.microsteps(16);
+  driver2.microsteps(16);
+
+  // TCOOLTHRS: velocity threshold above which StallGuard is active.
+  // 0xFFFFF = always active.
+  driver1.TCOOLTHRS(0xFFFFF);
+  driver2.TCOOLTHRS(0xFFFFF);
+
+  // SGTHRS: StallGuard sensitivity. Range 0–255. Higher = trips more easily.
+  // START AT 10 (conservative). Tune empirically:
+  //   1. Add Serial.print(driver1.SG_RESULT()) inside makeHomingStep() temporarily.
+  //   2. Trigger homing; note SG_RESULT value as motor hits the hard stop.
+  //   3. Set SGTHRS ≈ (255 - that_value) / 2. Typical range: 15–35.
+  driver1.SGTHRS(10);
+  driver2.SGTHRS(10);
+
+  // SpreadCycle is MANDATORY for StallGuard — TMC2209 defaults to StealthChop.
+  // Without this, DIAG never fires from SG.
+  driver1.en_spreadCycle(true);
+  driver2.en_spreadCycle(true);
+
+  // Invert motor 2 direction at driver level (motors are mirrored).
+#if MOTOR_2_DIR_INVERTED
+  driver2.shaft(true);
+#endif
+
+  // Verify UART communication — genuine TMC2209 returns 0x21.
+  // If either prints 0 or 0xFF, check wiring and MS1/MS2 address pins.
+  Serial.print("Driver 1 version: 0x"); Serial.println(driver1.version(), HEX);
+  Serial.print("Driver 2 version: 0x"); Serial.println(driver2.version(), HEX);
+}
+
+// ── Preset button logic ───────────────────────────────────────────────────────
+
 void onPresetButtonDown(unsigned int presetNumber) {
   if (presetButtonStates[presetNumber] == HIGH) {
     presetButtonPressedTimeMs = millis();
-    presetButtonStates[presetNumber] = LOW; 
+    presetButtonStates[presetNumber] = LOW;
   }
 }
 
@@ -236,6 +420,28 @@ void onPresetButtonUp(unsigned int presetNumber) {
 }
 
 void checkPresetButtonStates() {
+  bool btn0 = (digitalRead(PRESET_BUTTONS_PINS[0]) == LOW);
+  bool btn1 = (digitalRead(PRESET_BUTTONS_PINS[1]) == LOW);
+
+  // Both buttons held simultaneously for >3s → trigger homing
+  if (btn0 && btn1) {
+    if (bothPresetsPressedSince == 0) {
+      bothPresetsPressedSince = millis();
+    } else if (!homingTriggered && millis() - bothPresetsPressedSince > 3000) {
+      homingTriggered = true;
+      if (currMotionState == STOPPED) {
+        performHoming();
+      }
+    }
+    // Block individual preset actions while both are held
+    return;
+  }
+
+  // Reset combo tracking when either button is released
+  bothPresetsPressedSince = 0;
+  homingTriggered = false;
+
+  // Normal per-button preset logic
   for (int i = 0; i < 2; i++) {
     int state = digitalRead(PRESET_BUTTONS_PINS[i]);
     if (state == LOW) {
@@ -274,32 +480,72 @@ void resetDeskHeightToZero() {
 
 void setup() {
   Serial.begin(921600);
+
+  // Motor 1
+  pinMode(DIR_PIN_1, OUTPUT);
+  pinMode(ENABLE_PIN_1, OUTPUT);
+  digitalWrite(ENABLE_PIN_1, HIGH); // disabled at boot
+  pinMode(STEP_PIN_1, OUTPUT);
+
+  // Motor 2
+  pinMode(DIR_PIN_2, OUTPUT);
+  pinMode(ENABLE_PIN_2, OUTPUT);
+  digitalWrite(ENABLE_PIN_2, HIGH); // disabled at boot
+  pinMode(STEP_PIN_2, OUTPUT);
+
+  // DIAG pins (interrupt-driven stall detection)
+  pinMode(DIAG_PIN_1, INPUT);
+  pinMode(DIAG_PIN_2, INPUT);
+  attachInterrupt(digitalPinToInterrupt(DIAG_PIN_1), onMotor1Stall, RISING);
+  attachInterrupt(digitalPinToInterrupt(DIAG_PIN_2), onMotor2Stall, RISING);
+
+  // Button inputs
   pinMode(DESK_UP_PIN, INPUT_PULLUP);
   pinMode(DESK_DOWN_PIN, INPUT_PULLUP);
   pinMode(DESK_UP_GROUND_PIN, INPUT_PULLDOWN);
   pinMode(PRESET_1_PIN, INPUT_PULLUP);
-  pinMode(DIR_PIN, OUTPUT);
-  pinMode(ENABLE_PIN, OUTPUT);
-  digitalWrite(ENABLE_PIN, HIGH);
-  pinMode(STEP_PIN, OUTPUT);
   pinMode(PRESET_2_PIN, INPUT_PULLUP);
+
+  // Distance sensor (pins initialized, not actively used)
   pinMode(DIST_SENSOR_ECHO_PIN, INPUT_PULLDOWN);
   pinMode(DIST_SENSOR_TRIG_PIN, OUTPUT);
+
+  // TMC2209 UART init + StallGuard configuration
+  initDrivers();
+
   // resetDeskHeightToZero();
   currDeskHeight = readDeskHeight();
   Serial.println((String)"Initial desk height: " + currDeskHeight);
 }
 
 void loop() {
+  // ── Unexpected stall guard ────────────────────────────────────────────────
+  // If a DIAG interrupt fired during normal motion, stop both motors immediately.
+  // Do NOT backtrack — desk may be jammed. Re-home after an unexpected stall.
+  if ((motor1Stalled || motor2Stalled) && currMotionState != STOPPED) {
+    Serial.println("STALL DETECTED — emergency stop");
+    motor1Stalled = false;
+    motor2Stalled = false;
+    currMotionState = STOPPED;
+    currMotionDir = MOTION_STATE_DISABLED;
+    resetAcceleration();
+    storeDeskHeight(currDeskHeight);
+    setDeskHeightBoundaries(0, MOTOR_MAX_STEPS);
+    digitalWrite(ENABLE_PIN_1, HIGH);
+    digitalWrite(ENABLE_PIN_2, HIGH);
+    return;
+  }
+
   checkPresetButtonStates();
   checkMoveButtonStates();
-  if (currMotionState == RUNNING 
-      && !isWithinHeightBoundaries(currDeskHeight + (currMotionDir*accelerationSteps * 2))) {
+
+  if (currMotionState == RUNNING
+      && !isWithinHeightBoundaries(currDeskHeight + (currMotionDir * accelerationSteps * 2))) {
     decelarate();
-  } else if (currMotionState != STOPPED 
+  } else if (currMotionState != STOPPED
              && isWithinHeightBoundaries(currDeskHeight + currMotionDir)) {
-    if (currMotionState == ACCELERATING 
-        && isWithinHeightBoundaries(currDeskHeight + (currMotionDir*accelerationSteps))) {
+    if (currMotionState == ACCELERATING
+        && isWithinHeightBoundaries(currDeskHeight + (currMotionDir * accelerationSteps))) {
       // Don't accelerate when close to the boundaries.
       if (prevLoopTimeMs == -1) {
         prevLoopTimeMs = millis();
@@ -312,8 +558,6 @@ void loop() {
     }
     makeStep();
   } else if (currMotionState != STOPPED) {
-    // This will trigger when we started moving the desk within the boundaries and it reached its limit.
-    // currMotionState will be ACCELERATING. We want to setStop() to trigger backtrack.
     setStop();
   }
 }
