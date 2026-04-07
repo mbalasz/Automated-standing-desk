@@ -59,7 +59,7 @@ double maxSpeedDelayMs = 2;
 double minSpeedDelayMs = 0.23;
 double currSpeedDelayMs = maxSpeedDelayMs;
 double delayDeltaPerMs = (maxSpeedDelayMs - minSpeedDelayMs) / accelerationSteps;
-int prevLoopTimeMs = -1;
+int prevLoopTimeMs = 0;
 
 const unsigned int MOTOR_MAX_STEPS = 183000;
 unsigned int maxDeskHeight = MOTOR_MAX_STEPS;
@@ -196,7 +196,6 @@ void setMoveDown() {
 
 void resetAcceleration() {
   currSpeedDelayMs = maxSpeedDelayMs;
-  prevLoopTimeMs = -1;
   currAccelerationSteps = 0;
   currDecelerationSteps = 0;
 }
@@ -204,7 +203,6 @@ void resetAcceleration() {
 void startDeceleration() {
   Serial.println((String)"Started deceleration at height: " + currDeskHeight);
   currDecelerationSteps = 0;
-  prevLoopTimeMs = -1;
   currMotionState = DECELERATING;
 }
 
@@ -254,18 +252,14 @@ void setStop() {
   digitalWrite(ENABLE_PIN_2, HIGH);
 }
 
-void rampSpeedUp() {
-  int currTimeMs = millis();
-  currSpeedDelayMs -= delayDeltaPerMs * (currTimeMs - prevLoopTimeMs);
+void rampSpeedUp(int deltaTime) {
+  currSpeedDelayMs -= delayDeltaPerMs * deltaTime;
   currSpeedDelayMs = max(currSpeedDelayMs, minSpeedDelayMs);
-  prevLoopTimeMs = currTimeMs;
 }
 
-void rampSpeedDown() {
-  int currTimeMs = millis();
-  currSpeedDelayMs += delayDeltaPerMs * (currTimeMs - prevLoopTimeMs);
+void rampSpeedDown(int deltaTime) {
+  currSpeedDelayMs += delayDeltaPerMs * deltaTime;
   currSpeedDelayMs = min(currSpeedDelayMs, maxSpeedDelayMs);
-  prevLoopTimeMs = currTimeMs;
 }
 
 void handleEmergencyStop() {
@@ -519,12 +513,18 @@ void setup() {
   // TMC2209 UART init + StallGuard configuration
   initDrivers();
 
+  prevLoopTimeMs = millis();
+
   // resetDeskHeightToZero();
   currDeskHeight = readDeskHeight();
   Serial.println((String)"Initial desk height: " + currDeskHeight);
 }
 
 void loop() {
+  int now = millis();
+  int deltaTime = now - prevLoopTimeMs;
+  prevLoopTimeMs = now;
+
   if (motor1Stalled || motor2Stalled) {
     handleEmergencyStop();
     return;
@@ -546,11 +546,9 @@ void loop() {
 
   switch (currMotionState) {
     case ACCELERATING:
-      if (prevLoopTimeMs == -1) {
-        prevLoopTimeMs = millis();
-      } else if (currAccelerationSteps < accelerationSteps
-                 && isWithinHeightBoundaries(currDeskHeight + currMotionDir * (int)accelerationSteps)) {
-        rampSpeedUp();
+      if (currAccelerationSteps < accelerationSteps
+          && isWithinHeightBoundaries(currDeskHeight + currMotionDir * (int)accelerationSteps)) {
+        rampSpeedUp(deltaTime);
         currAccelerationSteps++;
       } else {
         currMotionState = RUNNING;
@@ -558,10 +556,8 @@ void loop() {
       break;
 
     case DECELERATING:
-      if (prevLoopTimeMs == -1) {
-        prevLoopTimeMs = millis();
-      } else if (currDecelerationSteps < currAccelerationSteps) {
-        rampSpeedDown();
+      if (currDecelerationSteps < currAccelerationSteps) {
+        rampSpeedDown(deltaTime);
         currDecelerationSteps++;
       } else {
         setStop();
