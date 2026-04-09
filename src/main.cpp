@@ -2,17 +2,17 @@
 #include <Preferences.h>
 #include <TMCStepper.h>
 
-// ── Motor 1 (left leg) ───────────────────────────────────────────────────────
-#define DIR_PIN_1    19
-#define ENABLE_PIN_1 18
-#define STEP_PIN_1    4
+// ── Motor 1 (left leg) — all pins on left side of ESP32 ─────────────────────
+#define STEP_PIN_1   33
+#define DIR_PIN_1    25
+#define ENABLE_PIN_1 27
 #define DIAG_PIN_1   34   // input-only GPIO
 
-// ── Motor 2 (right leg) ──────────────────────────────────────────────────────
-#define DIR_PIN_2    33
-#define ENABLE_PIN_2 27
+// ── Motor 2 (right leg) — all pins on right side of ESP32 ───────────────────
 #define STEP_PIN_2    5
-#define DIAG_PIN_2   35   // input-only GPIO
+#define DIR_PIN_2    18
+#define ENABLE_PIN_2 19
+#define DIAG_PIN_2   21
 
 // ── TMC2209 UART (Serial2) ────────────────────────────────────────────────────
 #define TMC_SERIAL_RX_PIN 16
@@ -359,26 +359,26 @@ void initDrivers() {
   driver1.rms_current(600);
   driver2.rms_current(600);
 
+  driver1.toff(4);
+  driver2.toff(4);
+  driver1.blank_time(24);
+  driver2.blank_time(24);
+
   driver1.microsteps(16);
   driver2.microsteps(16);
 
-  // TCOOLTHRS: velocity threshold above which StallGuard is active.
-  // 0xFFFFF = always active.
-  driver1.TCOOLTHRS(0xFFFFF);
-  driver2.TCOOLTHRS(0xFFFFF);
+  // TCOOLTHRS: StallGuard activates when TSTEP < TCOOLTHRS (i.e. above this speed).
+  // At full speed TSTEP ~7072, at slowest ~26000. 10000 excludes slow/acceleration phase.
+  driver1.TCOOLTHRS(10000);
+  driver2.TCOOLTHRS(10000);
 
   // SGTHRS: StallGuard sensitivity. Range 0–255. Higher = trips more easily.
   // START AT 10 (conservative). Tune empirically:
   //   1. Add Serial.print(driver1.SG_RESULT()) inside makeHomingStep() temporarily.
   //   2. Trigger homing; note SG_RESULT value as motor hits the hard stop.
   //   3. Set SGTHRS ≈ (255 - that_value) / 2. Typical range: 15–35.
-  driver1.SGTHRS(10);
-  driver2.SGTHRS(10);
-
-  // SpreadCycle is MANDATORY for StallGuard — TMC2209 defaults to StealthChop.
-  // Without this, DIAG never fires from SG.
-  driver1.en_spreadCycle(true);
-  driver2.en_spreadCycle(true);
+  driver1.SGTHRS(20);
+  driver2.SGTHRS(20);
 
   // Invert motor 2 direction at driver level (motors are mirrored).
 #if MOTOR_2_DIR_INVERTED
@@ -468,6 +468,72 @@ void resetDeskHeightToZero() {
   storeDeskHeight(0);
 }
 
+// DEBUG: moves motors continuously and prints SG_RESULT. Apply finger resistance to
+// the shaft to see SG_RESULT drop and stall trigger. Comment out when done.
+void debugTestStallGuard() {
+  Serial.println("Debug: StallGuard test — apply resistance to shaft to trigger stall");
+  currSpeedDelayMs = minSpeedDelayMs;
+  currMotionDir = MOTION_STATE_UP;
+  setDirUp();
+  setMotorsEnabled(true);
+  Serial.print("GCONF driver1: 0x"); Serial.println(driver1.GCONF(), HEX);
+  Serial.print("GCONF driver2: 0x"); Serial.println(driver2.GCONF(), HEX);
+
+  unsigned long lastPrint = 0;
+  // Allow StallGuard to stabilize before checking for stalls
+  for (int i = 0; i < 1000; i++)
+  {
+    makeStep();
+    if (millis() - lastPrint > 200) {
+      Serial.print("SG1: "); Serial.print(driver1.SG_RESULT());
+      Serial.print("  SG2: "); Serial.println(driver2.SG_RESULT());
+      lastPrint = millis();
+    }
+  }
+  motor1Stalled = false;
+  motor2Stalled = false;
+
+  while (!motor1Stalled && !motor2Stalled) {
+    makeStep();
+    if (millis() - lastPrint > 200) {
+      Serial.print("SG1: "); Serial.print(driver1.SG_RESULT());
+      Serial.print("  SG2: "); Serial.print(driver2.SG_RESULT());
+      Serial.print("  TSTEP: "); Serial.println(driver1.TSTEP());
+      lastPrint = millis();
+    }
+  }
+
+  setMotorsEnabled(false);
+  currMotionDir = MOTION_STATE_DISABLED;
+  Serial.print("Debug: stall detected — SG1: "); Serial.print(driver1.SG_RESULT());
+  Serial.print("  SG2: "); Serial.println(driver2.SG_RESULT());
+}
+
+// DEBUG: moves each motor up then down by a fixed number of steps at slow speed.
+// Call once from setup(), comment out when done.
+void debugTestMotors() {
+  const int TEST_STEPS = 500;
+  Serial.println("Debug: motor test starting");
+  currSpeedDelayMs = maxSpeedDelayMs;
+  setMotorsEnabled(true);
+
+  Serial.println("Debug: moving up");
+  setDirUp();
+  currMotionDir = MOTION_STATE_UP;
+  for (int i = 0; i < TEST_STEPS; i++) makeStep();
+
+  delay(500);
+
+  Serial.println("Debug: moving down");
+  setDirDown();
+  currMotionDir = MOTION_STATE_DOWN;
+  for (int i = 0; i < TEST_STEPS; i++) makeStep();
+
+  setMotorsEnabled(false);
+  currMotionDir = MOTION_STATE_DISABLED;
+  Serial.println("Debug: motor test done");
+}
+
 void setup() {
   Serial.begin(921600);
 
@@ -508,6 +574,9 @@ void setup() {
   // resetDeskHeightToZero();
   currDeskHeight = readDeskHeight();
   Serial.println((String)"Initial desk height: " + currDeskHeight);
+
+  debugTestMotors();
+  debugTestStallGuard();
 }
 
 void loop() {
