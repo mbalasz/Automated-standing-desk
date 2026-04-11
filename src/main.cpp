@@ -31,7 +31,7 @@
 #define DESK_UP_PIN 14
 #define DESK_UP_GROUND_PIN 26
 #define DESK_DOWN_PIN 12
-#define PRESET_1_PIN 25
+#define PRESET_1_PIN 4
 #define PRESET_2_PIN 32
 #define DIST_SENSOR_TRIG_PIN 22
 #define DIST_SENSOR_ECHO_PIN 23
@@ -83,7 +83,7 @@ volatile bool motor2HomingDone = false;
 int moveUpButtonLastState = HIGH;
 int moveDownButtonLastState = HIGH;
 
-const int PRESET_BUTTONS_PINS[] = {32, 25};
+const int PRESET_BUTTONS_PINS[] = {32, 4};
 int presetButtonStates[] = {HIGH, HIGH};
 int presetButtonPressedTimeMs = -1;
 
@@ -354,10 +354,16 @@ void initDrivers() {
   driver1.begin();
   driver2.begin();
 
-  // RMS current in mA. Adjust to your motor spec.
-  // 600 mA is conservative for NEMA 17 — increase if motors skip steps.
-  driver1.rms_current(600);
-  driver2.rms_current(600);
+  // 42×48 stepper rated at 2000 mA per phase. TMC2209 max is also 2000 mA RMS.
+  // Start conservative and raise toward 2000 if motors skip steps under load.
+  // Ensure adequate driver cooling at higher currents.
+  driver1.rms_current(2000);
+  driver2.rms_current(2000);
+
+  // SpreadCycle: full torque at all speeds but StallGuard won't work.
+  // Disable and use TPWMTHRS for a per-speed mode split once torque is validated.
+  // driver1.en_spreadCycle(true);
+  // driver2.en_spreadCycle(true);
 
   driver1.toff(4);
   driver2.toff(4);
@@ -389,6 +395,8 @@ void initDrivers() {
   // If either prints 0 or 0xFF, check wiring and MS1/MS2 address pins.
   Serial.print("Driver 1 version: 0x"); Serial.println(driver1.version(), HEX);
   Serial.print("Driver 2 version: 0x"); Serial.println(driver2.version(), HEX);
+  Serial.print("Driver 1 RMS current: "); Serial.print(driver1.rms_current()); Serial.println(" mA");
+  Serial.print("Driver 2 RMS current: "); Serial.print(driver2.rms_current()); Serial.println(" mA");
 }
 
 // ── Preset button logic ───────────────────────────────────────────────────────
@@ -534,6 +542,87 @@ void debugTestMotors() {
   Serial.println("Debug: motor test done");
 }
 
+// DEBUG: accelerates up, runs at full speed for 2s, decelerates, then mirrors
+// the same motion going down so the desk returns to its starting position.
+// Call once from setup(), comment out when done.
+void debugTestRamp() {
+  const double TEST_SPEED_LIMIT_DELAY_MS = minSpeedDelayMs * 4; // quarter of full speed
+  const unsigned int TEST_ACCELERATION_STEPS = 500;
+  Serial.println("Debug: ramp test starting");
+  motor1Stalled = false;
+  motor2Stalled = false;
+  currSpeedDelayMs = maxSpeedDelayMs;
+  setMotorsEnabled(true);
+
+  auto stallDetected = [&]() {
+    setMotorsEnabled(false);
+    currMotionDir = MOTION_STATE_DISABLED;
+    currSpeedDelayMs = maxSpeedDelayMs;
+    Serial.print("Debug: stall detected — SG1: "); Serial.print(driver1.SG_RESULT());
+    Serial.print("  SG2: "); Serial.println(driver2.SG_RESULT());
+  };
+
+  // ── UP ───────────────────────────────────────────────────────────────────────
+  currMotionDir = MOTION_STATE_UP;
+  setDirUp();
+
+  Serial.println("Debug: accelerating up");
+  for (unsigned int i = 0; i < TEST_ACCELERATION_STEPS; i++) {
+    currSpeedDelayMs = max(currSpeedDelayMs - delayDeltaPerMs, TEST_SPEED_LIMIT_DELAY_MS);
+    makeStep();
+    // if (motor1Stalled || motor2Stalled) { stallDetected(); return; }
+  }
+
+  Serial.println("Debug: running up");
+  long runningSteps = 0;
+  unsigned long start = millis();
+  while (millis() - start < 500) {
+    makeStep();
+    runningSteps++;
+    // if (motor1Stalled || motor2Stalled) { stallDetected(); return; }
+  }
+
+  Serial.println("Debug: decelerating up");
+  for (unsigned int i = 0; i < TEST_ACCELERATION_STEPS; i++) {
+    currSpeedDelayMs = min(currSpeedDelayMs + delayDeltaPerMs, maxSpeedDelayMs);
+    makeStep();
+    // if (motor1Stalled || motor2Stalled) { stallDetected(); return; }
+  }
+
+  Serial.print("Debug: up done, running steps: "); Serial.println(runningSteps);
+  delay(500);
+
+  // ── DOWN (mirror of up — same step counts) ───────────────────────────────────
+  currSpeedDelayMs = maxSpeedDelayMs;
+  currMotionDir = MOTION_STATE_DOWN;
+  setDirDown();
+
+  Serial.println("Debug: accelerating down");
+  for (unsigned int i = 0; i < TEST_ACCELERATION_STEPS; i++) {
+    currSpeedDelayMs = max(currSpeedDelayMs - delayDeltaPerMs, TEST_SPEED_LIMIT_DELAY_MS);
+    makeStep();
+    // if (motor1Stalled || motor2Stalled) { stallDetected(); return; }
+  }
+
+  Serial.println("Debug: running down");
+  for (long i = 0; i < runningSteps; i++) {
+    makeStep();
+    // if (motor1Stalled || motor2Stalled) { stallDetected(); return; }
+  }
+
+  Serial.println("Debug: decelerating down");
+  for (unsigned int i = 0; i < TEST_ACCELERATION_STEPS; i++) {
+    currSpeedDelayMs = min(currSpeedDelayMs + delayDeltaPerMs, maxSpeedDelayMs);
+    makeStep();
+    // if (motor1Stalled || motor2Stalled) { stallDetected(); return; }
+  }
+
+  setMotorsEnabled(false);
+  currMotionDir = MOTION_STATE_DISABLED;
+  currSpeedDelayMs = maxSpeedDelayMs;
+  Serial.println("Debug: ramp test done");
+}
+
 void setup() {
   Serial.begin(921600);
 
@@ -575,8 +664,9 @@ void setup() {
   currDeskHeight = readDeskHeight();
   Serial.println((String)"Initial desk height: " + currDeskHeight);
 
-  debugTestMotors();
-  debugTestStallGuard();
+  // debugTestMotors();
+  // debugTestStallGuard();
+  debugTestRamp();
 }
 
 void loop() {
