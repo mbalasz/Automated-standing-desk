@@ -1,319 +1,205 @@
 #include <Arduino.h>
 #include <Preferences.h>
+#include "FastAccelStepper.h"
 
-#define DESK_UP_PIN 14
-#define DESK_UP_GROUND_PIN 26
-#define DESK_DOWN_PIN 12
-#define PRESET_1_PIN 25
-#define PRESET_2_PIN 32
-#define DIR_PIN 19
-#define ENABLE_PIN 18
-#define STEP_PIN 4
-#define DIST_SENSOR_TRIG_PIN 22
-#define DIST_SENSOR_ECHO_PIN 23
+// --- Pin Definitions ---
+#define DESK_UP_PIN             14
+#define DESK_UP_GROUND_PIN      26
+#define DESK_DOWN_PIN           12
+#define PRESET_1_PIN            25
+#define PRESET_2_PIN            32
+#define DIR_PIN                 19
+#define ENABLE_PIN              18
+#define STEP_PIN                4
+#define DIST_SENSOR_TRIG_PIN    22
+#define DIST_SENSOR_ECHO_PIN    23
 
-#define MOTION_STATE_UP 1
-#define MOTION_STATE_DOWN -1
-#define MOTION_STATE_DISABLED 0
+// --- Motor Parameters ---
+// Driver: DM542Y at 1600 steps/rev (1/8 microstepping, SW5-SW8 DIP switches).
+// Motor:  1.8°/step = 200 full steps/rev × 8 = 1600 steps/rev.
+//
+// Speed formula: MOTOR_MAX_SPEED_HZ / 1600 steps/rev / 3 rev/cm
+//   e.g. 4347 steps/s → ~0.91 cm/s → ~33 s for a 30 cm range (conservative)
+//
+// TODO: raise MOTOR_MAX_SPEED_HZ to ~14000 for a more typical desk speed of ~3 cm/s (~10 s for 30 cm).
+#define MOTOR_MAX_SPEED_HZ      4347   // steps/s at full speed
+#define MOTOR_ACCELERATION      4000   // steps/s² — ramp steepness (higher = faster ramp)
+#define MOTOR_MAX_STEPS         183000 // TODO: recalibrate by running desk end-to-end — measured at 2000 steps/rev, now invalid at 1600
 
-#define PRESET_PREFS_NAMESPACE "preset"
-#define DESK_PREFS_NAMESPACE "desk"
-#define DESK_PREFS_HEIGHT_KEY "height"
+// Small reverse move after stopping to release mechanical tension in the leadscrew.
+#define BACKTRACK_STEPS_UP      300
+#define BACKTRACK_STEPS_DOWN    60
 
-#define STOPPED 0
-#define RUNNING 1
-#define DECELERATING 2
-#define ACCELERATING 3
+// --- NVS Namespaces ---
+#define PRESET_PREFS_NAMESPACE  "preset"
+#define DESK_PREFS_NAMESPACE    "desk"
+#define DESK_PREFS_HEIGHT_KEY   "height"
 
-const double stepDelayMs = 0.1;
-unsigned int accelerationSteps = 2200;
-unsigned int currAccelerationSteps = 0;
-const unsigned int BACKTRACK_STEPS_AFTER_GOING_UP = 300;
-const unsigned int BACKTRACK_STEPS_AFTER_GOING_DOWN = 60;
-double maxSpeedDelayMs = 2;
-double minSpeedDelayMs = 0.23;
-double currSpeedDelayMs = maxSpeedDelayMs;
-double delayDeltaPerMs = (maxSpeedDelayMs-minSpeedDelayMs) / accelerationSteps;
-int prevLoopTimeMs = -1;
+// --- Globals ---
+FastAccelStepperEngine engine = FastAccelStepperEngine();
+FastAccelStepper *stepper = NULL;
+Preferences preferences;
 
-const unsigned int MOTOR_MAX_STEPS = 183000;
-bool enabled = false;
-unsigned int maxDeskHeight = MOTOR_MAX_STEPS;
-unsigned int minDeskHeight = 0;
- int currDeskHeight = 0;
-int currMotionState = STOPPED;
-int currMotionDir = 0; // -1: moving down, 1: moving up, 0: not moving
+int currMotionDir = 0;  // 1 = moving up, -1 = moving down, 0 = idle
+bool wasRunning = false;
 
 int moveUpButtonLastState = HIGH;
 int moveDownButtonLastState = HIGH;
-
-const int PRESET_BUTTONS_PINS[] = {32, 25};
+const int PRESET_BUTTONS_PINS[] = {PRESET_2_PIN, PRESET_1_PIN};
 int presetButtonStates[] = {HIGH, HIGH};
-int presetButtonLastState = HIGH;
 int presetButtonPressedTimeMs = -1;
 
-Preferences preferences;
-
-void intToString(unsigned int number, char* const str) {
-  sprintf(str, "%u", number);
+// --- NVS Helpers ---
+void intToString(unsigned int n, char* str) {
+  sprintf(str, "%u", n);
 }
 
-void storePreset(unsigned int presetNumber, unsigned int deskHeight) {
-  Serial.println((String)"Storing preset: " + presetNumber + " with value: " + deskHeight);
-  char presetNumberStr[3];
-  intToString(presetNumber, presetNumberStr);
+void storePreset(unsigned int presetNumber, int32_t height) {
+  Serial.println((String)"Storing preset " + presetNumber + " = " + height);
+  char key[3];
+  intToString(presetNumber, key);
   preferences.begin(PRESET_PREFS_NAMESPACE);
-  preferences.putUInt(presetNumberStr, deskHeight);
+  preferences.putUInt(key, (unsigned int)height);
   preferences.end();
 }
 
-unsigned int readPreset(unsigned int presetNumber) {
-  char presetNumberStr[3];
-  intToString(presetNumber, presetNumberStr);
+int32_t readPreset(unsigned int presetNumber) {
+  char key[3];
+  intToString(presetNumber, key);
   preferences.begin(PRESET_PREFS_NAMESPACE);
-  unsigned int presetValue = preferences.getUInt(presetNumberStr);
+  int32_t val = preferences.getUInt(key);
   preferences.end();
-  Serial.println((String)"Retrieved preset: " + presetNumber + " with value: " + presetValue);
-  return presetValue;
+  Serial.println((String)"Retrieved preset " + presetNumber + " = " + val);
+  return val;
 }
 
-void storeDeskHeight(unsigned int height) {
+void storeDeskHeight(int32_t height) {
   Serial.println((String)"Storing height: " + height);
   preferences.begin(DESK_PREFS_NAMESPACE);
-  preferences.putUInt(DESK_PREFS_HEIGHT_KEY, height);
+  preferences.putUInt(DESK_PREFS_HEIGHT_KEY, (unsigned int)height);
   preferences.end();
 }
 
-unsigned int readDeskHeight() {
+int32_t readDeskHeight() {
   preferences.begin(DESK_PREFS_NAMESPACE);
-  unsigned int height = preferences.getUInt(DESK_PREFS_HEIGHT_KEY);
+  int32_t height = preferences.getUInt(DESK_PREFS_HEIGHT_KEY);
   preferences.end();
   Serial.println((String)"Retrieved height: " + height);
   return height;
 }
 
-void setDeskHeightBoundaries(unsigned int minHeight, unsigned int maxHeight) {
-  Serial.println((String)"Setting desk height boundaries to: (" + minHeight + "," + maxHeight + ")");
-  minDeskHeight = max(0U, minHeight);
-  maxDeskHeight = min(MOTOR_MAX_STEPS, maxHeight);
+// IMPORTANT: One-off calibration only. Uncomment call in setup(), upload, re-comment, re-upload.
+void resetDeskHeightToZero() {
+  storeDeskHeight(0);
 }
 
-bool isWithinHeightBoundaries(int height) {
-  return height >= minDeskHeight && height <= maxDeskHeight;
+// --- Motion ---
+
+// Called whenever the motor finishes any move (button release or preset arrival).
+// Applies a short reverse (backtrack) to release leadscrew tension, then persists height.
+void onMotorStop() {
+  int backtrackSteps = (currMotionDir > 0) ? -BACKTRACK_STEPS_UP : BACKTRACK_STEPS_DOWN;
+  Serial.println((String)"Backtracking " + backtrackSteps + " steps");
+  stepper->move(backtrackSteps, /*blocking=*/true);
+  int32_t finalHeight = stepper->getCurrentPosition();
+  Serial.println((String)"Stopped at height: " + finalHeight);
+  storeDeskHeight(finalHeight);
+  currMotionDir = 0;
 }
 
-void setMoveUp() {
-  if (currMotionState != STOPPED 
-      || !isWithinHeightBoundaries(currDeskHeight + MOTION_STATE_UP * (BACKTRACK_STEPS_AFTER_GOING_UP + 1))) { 
-    return; 
-  }
-  Serial.println("setMoveUp");
-  digitalWrite(ENABLE_PIN, LOW);
-  digitalWrite(DIR_PIN, HIGH);
-  currMotionState = ACCELERATING;
-  currMotionDir = MOTION_STATE_UP;
+void moveUp() {
+  if (stepper->isRunning()) return;
+  Serial.println("moveUp");
+  currMotionDir = 1;
+  stepper->moveTo(MOTOR_MAX_STEPS);
 }
 
-void setMoveDown() {
-  if (currMotionState != STOPPED 
-      || !isWithinHeightBoundaries(currDeskHeight + MOTION_STATE_DOWN * (BACKTRACK_STEPS_AFTER_GOING_DOWN + 1))) { 
-    return; 
-  }
-  Serial.println("setMoveDown");
-  digitalWrite(ENABLE_PIN, LOW);
-  digitalWrite(DIR_PIN, LOW);
-  currMotionState = ACCELERATING;
-  currMotionDir = MOTION_STATE_DOWN;
+void moveDown() {
+  if (stepper->isRunning()) return;
+  Serial.println("moveDown");
+  currMotionDir = -1;
+  stepper->moveTo(0);
 }
 
-void resetAcceleration() {
-  currSpeedDelayMs = maxSpeedDelayMs;
-  prevLoopTimeMs = -1;
-  currAccelerationSteps = 0;
+void moveToHeight(int32_t target) {
+  if (stepper->isRunning()) return;
+  target = constrain(target, 0, MOTOR_MAX_STEPS);
+  int32_t current = stepper->getCurrentPosition();
+  if (target == current) return;
+  Serial.println((String)"moveToHeight: " + target);
+  currMotionDir = (target > current) ? 1 : -1;
+  stepper->moveTo(target);
 }
 
-void makeStep() {
-  digitalWrite(STEP_PIN, HIGH);
-  delayMicroseconds((int) (stepDelayMs * 1000)); // 100 microseconds
-  digitalWrite(STEP_PIN, LOW);
-  delayMicroseconds((int) (currSpeedDelayMs * 1000));
-  currDeskHeight += currMotionDir;
-}
-
-void backtrack() {
-  Serial.println("Backtracking");
-  int backtrackSteps = currMotionDir == MOTION_STATE_DOWN 
-    ? BACKTRACK_STEPS_AFTER_GOING_DOWN 
-    : BACKTRACK_STEPS_AFTER_GOING_UP;
-  currMotionDir *= -1;
-  digitalWrite(DIR_PIN, !digitalRead(DIR_PIN));
-  while(backtrackSteps-- > 0) {
-    makeStep();
-  }
-}
-
-void setStop() {
-  if (currMotionState == STOPPED) { 
-    return; 
-  }
-  Serial.println((String) "setStop at height: " + currDeskHeight);
-  backtrack();
-  currMotionState = STOPPED;
-  currMotionDir = MOTION_STATE_DISABLED;
-  resetAcceleration();
-  storeDeskHeight(currDeskHeight);
-  setDeskHeightBoundaries(0, MOTOR_MAX_STEPS);
-  // Disable motor after a short delay to release torque more gracefully
-  // The power consumption when motor is disabled is 6W and where it has holding torque it's 9.5W.
-  // The savings are negligible and not holding the torque can lead to miscalibration of height over time.
-  delay(500);
-  digitalWrite(ENABLE_PIN, HIGH);
-}
-
-void changeAcceleration(int direction) {
-  int currTimeMs = millis();
-  int elapsedTimeMs = currTimeMs - prevLoopTimeMs;
-  currSpeedDelayMs -= (direction * delayDeltaPerMs * elapsedTimeMs);
-  if (direction == -1) {
-    currSpeedDelayMs = min(currSpeedDelayMs, maxSpeedDelayMs);
-  } else {
-    currSpeedDelayMs = max(currSpeedDelayMs, minSpeedDelayMs);
-  }
-  prevLoopTimeMs = currTimeMs;
-}
-
-void decelarate() {
-  if (currMotionState == STOPPED) {
-    return;
-  }
-  Serial.println((String) "Started deceleration at height: " + currDeskHeight);
-
-  int currDecelerationSteps = 0;
-  prevLoopTimeMs = -1;
-  while (currDecelerationSteps++ < currAccelerationSteps 
-         && isWithinHeightBoundaries(currDeskHeight + currMotionDir)) {
-    if (prevLoopTimeMs == -1) {
-      prevLoopTimeMs = millis();
-    } else if (currSpeedDelayMs < maxSpeedDelayMs) {
-      changeAcceleration(-1);
-    } 
-    makeStep();
-  }
-  currMotionState = DECELERATING;
-}
-
-void setMoveToHeight(unsigned int height) {
-  if (currMotionState != STOPPED) {
-    // Ignore new actions when the desk is already moving.
-    return;
-  }
-  Serial.println((String) "Moving to height: " + height);
-  if (currDeskHeight > height) {
-    setDeskHeightBoundaries(height, MOTOR_MAX_STEPS);
-    setMoveDown();
-  } else {
-    setDeskHeightBoundaries(0, height);
-    setMoveUp();
-  }
-}
-
-void onPresetButtonDown(unsigned int presetNumber) {
-  if (presetButtonStates[presetNumber] == HIGH) {
-    presetButtonPressedTimeMs = millis();
-    presetButtonStates[presetNumber] = LOW; 
-  }
-}
-
-void onPresetButtonUp(unsigned int presetNumber) {
-  if (presetButtonStates[presetNumber] == LOW) {
-    if (millis() - presetButtonPressedTimeMs > 2000) {
-      storePreset(presetNumber + 1, currDeskHeight);
-    } else {
-      setMoveToHeight(readPreset(presetNumber + 1));
-    }
-    presetButtonStates[presetNumber] = HIGH;
-  }
-}
-
+// --- Button Handlers ---
 void checkPresetButtonStates() {
   for (int i = 0; i < 2; i++) {
     int state = digitalRead(PRESET_BUTTONS_PINS[i]);
-    if (state == LOW) {
-      onPresetButtonDown(i);
-    } else {
-      onPresetButtonUp(i);
+    if (state == LOW && presetButtonStates[i] == HIGH) {
+      presetButtonPressedTimeMs = millis();
+      presetButtonStates[i] = LOW;
+    } else if (state == HIGH && presetButtonStates[i] == LOW) {
+      if (millis() - presetButtonPressedTimeMs > 2000) {
+        storePreset(i + 1, stepper->getCurrentPosition());
+      } else {
+        moveToHeight(readPreset(i + 1));
+      }
+      presetButtonStates[i] = HIGH;
     }
   }
 }
 
 void checkMoveButtonStates() {
-  int moveUpButtonCurrState = digitalRead(DESK_UP_PIN);
-  int moveDownButtonCurrState = digitalRead(DESK_DOWN_PIN);
-  if (moveUpButtonCurrState == LOW && moveUpButtonLastState == HIGH) {
-    setMoveUp();
-  } else if (moveUpButtonCurrState == HIGH && moveUpButtonLastState == LOW) {
-    decelarate();
-    setStop();
-  }
+  int upState   = digitalRead(DESK_UP_PIN);
+  int downState = digitalRead(DESK_DOWN_PIN);
 
-  if (moveDownButtonCurrState == LOW && moveDownButtonLastState == HIGH) {
-    setMoveDown();
-  } else if (moveDownButtonCurrState == HIGH && moveDownButtonLastState == LOW) {
-    decelarate();
-    setStop();
-  }
-  moveUpButtonLastState = moveUpButtonCurrState;
-  moveDownButtonLastState = moveDownButtonCurrState;
+  if (upState == LOW && moveUpButtonLastState == HIGH)         moveUp();
+  else if (upState == HIGH && moveUpButtonLastState == LOW)    stepper->stopMove();
+
+  if (downState == LOW && moveDownButtonLastState == HIGH)     moveDown();
+  else if (downState == HIGH && moveDownButtonLastState == LOW) stepper->stopMove();
+
+  moveUpButtonLastState   = upState;
+  moveDownButtonLastState = downState;
 }
 
-// IMPORTANT: Only use this method as a one-off when desk height is miscalibrated.
-// After resetting the height, comment out all invocations and reupload the code.
-void resetDeskHeightToZero() {
-  storeDeskHeight(0);
-}
-
+// --- Arduino Entry Points ---
 void setup() {
   Serial.begin(921600);
-  pinMode(DESK_UP_PIN, INPUT_PULLUP);
-  pinMode(DESK_DOWN_PIN, INPUT_PULLUP);
-  pinMode(DESK_UP_GROUND_PIN, INPUT_PULLDOWN);
-  pinMode(PRESET_1_PIN, INPUT_PULLUP);
-  pinMode(DIR_PIN, OUTPUT);
-  pinMode(ENABLE_PIN, OUTPUT);
-  digitalWrite(ENABLE_PIN, HIGH);
-  pinMode(STEP_PIN, OUTPUT);
-  pinMode(PRESET_2_PIN, INPUT_PULLUP);
+
+  pinMode(DESK_UP_PIN,          INPUT_PULLUP);
+  pinMode(DESK_DOWN_PIN,        INPUT_PULLUP);
+  pinMode(DESK_UP_GROUND_PIN,   INPUT_PULLDOWN);
+  pinMode(PRESET_1_PIN,         INPUT_PULLUP);
+  pinMode(PRESET_2_PIN,         INPUT_PULLUP);
   pinMode(DIST_SENSOR_ECHO_PIN, INPUT_PULLDOWN);
   pinMode(DIST_SENSOR_TRIG_PIN, OUTPUT);
+
+  engine.init();
+  stepper = engine.stepperConnectToPin(STEP_PIN);
+  stepper->setDirectionPin(DIR_PIN);
+  stepper->setEnablePin(ENABLE_PIN);
+  stepper->setAutoEnable(true);
+  // Motor power consumption: 6W disabled, 9.5W with holding torque.
+  // Disable after 500ms to release torque; savings are minor but avoids long-term miscalibration.
+  stepper->setDelayToDisable(500);
+  stepper->setSpeedInHz(MOTOR_MAX_SPEED_HZ);
+  stepper->setAcceleration(MOTOR_ACCELERATION);
+
   // resetDeskHeightToZero();
-  currDeskHeight = readDeskHeight();
-  Serial.println((String)"Initial desk height: " + currDeskHeight);
+  int32_t savedHeight = readDeskHeight();
+  stepper->setCurrentPosition(savedHeight);
+  Serial.println((String)"Initial desk height: " + savedHeight);
 }
 
 void loop() {
   checkPresetButtonStates();
   checkMoveButtonStates();
-  if (currMotionState == RUNNING 
-      && !isWithinHeightBoundaries(currDeskHeight + (currMotionDir*accelerationSteps * 2))) {
-    decelarate();
-  } else if (currMotionState != STOPPED 
-             && isWithinHeightBoundaries(currDeskHeight + currMotionDir)) {
-    if (currMotionState == ACCELERATING 
-        && isWithinHeightBoundaries(currDeskHeight + (currMotionDir*accelerationSteps))) {
-      // Don't accelerate when close to the boundaries.
-      if (prevLoopTimeMs == -1) {
-        prevLoopTimeMs = millis();
-      } else if (currAccelerationSteps < accelerationSteps) {
-        changeAcceleration(1);
-        currAccelerationSteps++;
-      } else {
-        currMotionState = RUNNING;
-      }
-    }
-    makeStep();
-  } else if (currMotionState != STOPPED) {
-    // This will trigger when we started moving the desk within the boundaries and it reached its limit.
-    // currMotionState will be ACCELERATING. We want to setStop() to trigger backtrack.
-    setStop();
+
+  // Detect motor-stop transitions to trigger backtrack and height persistence.
+  bool isRunning = stepper->isRunning();
+  if (wasRunning && !isRunning && currMotionDir != 0) {
+    onMotorStop();
   }
+  wasRunning = isRunning;
 }
