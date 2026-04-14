@@ -200,7 +200,7 @@ void loop() {
 
   // Detect motor-stop transitions to trigger backtrack and height persistence.
   bool isRunning = stepper->isRunning();
-  if (wasRunning && !isRunning && moveDirection != IDLE) {
+  if (wasRunning && !isRunning) {
     onMotorStop();
   }
   wasRunning = isRunning;
