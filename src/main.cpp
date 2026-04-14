@@ -35,12 +35,14 @@
 #define DESK_PREFS_NAMESPACE    "desk"
 #define DESK_PREFS_HEIGHT_KEY   "height"
 
+enum MoveDirection { IDLE, UP, DOWN };
+
 // --- Globals ---
 FastAccelStepperEngine engine = FastAccelStepperEngine();
 FastAccelStepper *stepper = NULL;
 Preferences preferences;
 
-int currMotionDir = 0;  // 1 = moving up, -1 = moving down, 0 = idle
+MoveDirection moveDirection = IDLE;
 bool wasRunning = false;
 
 int moveUpButtonLastState = HIGH;
@@ -98,26 +100,26 @@ void resetDeskHeightToZero() {
 // Called whenever the motor finishes any move (button release or preset arrival).
 // Applies a short reverse (backtrack) to release leadscrew tension, then persists height.
 void onMotorStop() {
-  int backtrackSteps = (currMotionDir > 0) ? -BACKTRACK_STEPS_UP : BACKTRACK_STEPS_DOWN;
+  int backtrackSteps = (moveDirection == UP) ? -BACKTRACK_STEPS_UP : BACKTRACK_STEPS_DOWN;
   Serial.println((String)"Backtracking " + backtrackSteps + " steps");
   stepper->move(backtrackSteps, /*blocking=*/true);
   int32_t finalHeight = stepper->getCurrentPosition();
   Serial.println((String)"Stopped at height: " + finalHeight);
   storeDeskHeight(finalHeight);
-  currMotionDir = 0;
+  moveDirection = IDLE;
 }
 
 void moveUp() {
   if (stepper->isRunning()) return;
   Serial.println("moveUp");
-  currMotionDir = 1;
+  moveDirection = UP;
   stepper->moveTo(MOTOR_MAX_STEPS);
 }
 
 void moveDown() {
   if (stepper->isRunning()) return;
   Serial.println("moveDown");
-  currMotionDir = -1;
+  moveDirection = DOWN;
   stepper->moveTo(0);
 }
 
@@ -127,7 +129,7 @@ void moveToHeight(int32_t target) {
   int32_t current = stepper->getCurrentPosition();
   if (target == current) return;
   Serial.println((String)"moveToHeight: " + target);
-  currMotionDir = (target > current) ? 1 : -1;
+  moveDirection = (target > current) ? UP : DOWN;
   stepper->moveTo(target);
 }
 
@@ -198,7 +200,7 @@ void loop() {
 
   // Detect motor-stop transitions to trigger backtrack and height persistence.
   bool isRunning = stepper->isRunning();
-  if (wasRunning && !isRunning && currMotionDir != 0) {
+  if (wasRunning && !isRunning && moveDirection != IDLE) {
     onMotorStop();
   }
   wasRunning = isRunning;
