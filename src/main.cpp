@@ -1,18 +1,20 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include "FastAccelStepper.h"
+#include <TM1637Display.h>
 
 // --- Pin Definitions ---
-#define DESK_UP_PIN             14
-#define DESK_UP_GROUND_PIN      26
-#define DESK_DOWN_PIN           12
-#define PRESET_1_PIN            25
-#define PRESET_2_PIN            32
-#define DIR_PIN                 19
-#define ENABLE_PIN              18
-#define STEP_PIN                4
+#define DESK_UP_PIN             18
+#define DESK_DOWN_PIN           13
+#define PRESET_1_PIN            5
+#define PRESET_2_PIN            17
+#define DIR_PIN                 27
+#define ENABLE_PIN              33  // MF+ on DM542Y
+#define STEP_PIN                26
 #define DIST_SENSOR_TRIG_PIN    22
 #define DIST_SENSOR_ECHO_PIN    23
+#define DISPLAY_CLK_PIN         2
+#define DISPLAY_DIO_PIN         15
 
 // --- Motor Parameters ---
 // Driver: DM542Y at 1600 steps/rev (1/8 microstepping, SW5-SW8 DIP switches).
@@ -22,8 +24,8 @@
 //   e.g. 4347 steps/s → ~0.91 cm/s → ~33 s for a 30 cm range (conservative)
 //
 // TODO: raise MOTOR_MAX_SPEED_HZ to ~14000 for a more typical desk speed of ~3 cm/s (~10 s for 30 cm).
-#define MOTOR_MAX_SPEED_HZ      4347   // steps/s at full speed
-#define MOTOR_ACCELERATION      4000   // steps/s² — ramp steepness (higher = faster ramp)
+#define MOTOR_MAX_SPEED_HZ      2000   // steps/s at full speed
+#define MOTOR_ACCELERATION      900   // steps/s² — ramp steepness (higher = faster ramp)
 #define MOTOR_MAX_STEPS         183000 // TODO: recalibrate by running desk end-to-end — measured at 2000 steps/rev, now invalid at 1600
 
 // Small reverse move after stopping to release mechanical tension in the leadscrew.
@@ -41,9 +43,11 @@ enum MoveDirection { IDLE, UP, DOWN };
 FastAccelStepperEngine engine = FastAccelStepperEngine();
 FastAccelStepper *stepper = NULL;
 Preferences preferences;
+TM1637Display display(DISPLAY_CLK_PIN, DISPLAY_DIO_PIN);
 
 MoveDirection moveDirection = IDLE;
 bool wasRunning = false;
+int32_t lastDisplayedHeight = -1;
 
 int moveUpButtonLastState = HIGH;
 int moveDownButtonLastState = HIGH;
@@ -100,10 +104,13 @@ void resetDeskHeightToZero() {
 // Called whenever the motor finishes any move (button release or preset arrival).
 // Applies a short reverse (backtrack) to release leadscrew tension, then persists height.
 void onMotorStop() {
+  display.showNumberDec(stepper->getCurrentPosition() / 100, true);
+
   int backtrackSteps = (moveDirection == UP) ? -BACKTRACK_STEPS_UP : BACKTRACK_STEPS_DOWN;
   Serial.println((String)"Backtracking " + backtrackSteps + " steps");
   stepper->move(backtrackSteps, /*blocking=*/true);
   int32_t finalHeight = stepper->getCurrentPosition();
+  lastDisplayedHeight = finalHeight;
   Serial.println((String)"Stopped at height: " + finalHeight);
   storeDeskHeight(finalHeight);
   moveDirection = IDLE;
@@ -165,17 +172,35 @@ void checkMoveButtonStates() {
   moveDownButtonLastState = downState;
 }
 
+// --- Debug ---
+void debugMotorTest() {
+  stepper->setSpeedInHz(500);
+  stepper->setAcceleration(200);
+  Serial.println("DEBUG: moving forward 1000 steps...");
+  stepper->move(1000);
+  while (stepper->isRunning()) delay(10);
+  delay(500);
+  Serial.println("DEBUG: moving backward 1000 steps...");
+  stepper->move(-1000);
+  while (stepper->isRunning()) delay(10);
+  Serial.println("DEBUG: motor test done");
+  stepper->setSpeedInHz(MOTOR_MAX_SPEED_HZ);
+  stepper->setAcceleration(MOTOR_ACCELERATION);
+}
+
 // --- Arduino Entry Points ---
 void setup() {
   Serial.begin(921600);
 
   pinMode(DESK_UP_PIN,          INPUT_PULLUP);
   pinMode(DESK_DOWN_PIN,        INPUT_PULLUP);
-  pinMode(DESK_UP_GROUND_PIN,   INPUT_PULLDOWN);
   pinMode(PRESET_1_PIN,         INPUT_PULLUP);
   pinMode(PRESET_2_PIN,         INPUT_PULLUP);
   pinMode(DIST_SENSOR_ECHO_PIN, INPUT_PULLDOWN);
   pinMode(DIST_SENSOR_TRIG_PIN, OUTPUT);
+
+  display.setBrightness(0x0f);
+  display.showNumberDecEx(0, 0, true);
 
   engine.init();
   stepper = engine.stepperConnectToPin(STEP_PIN);
@@ -188,7 +213,8 @@ void setup() {
   stepper->setSpeedInHz(MOTOR_MAX_SPEED_HZ);
   stepper->setAcceleration(MOTOR_ACCELERATION);
 
-  // resetDeskHeightToZero();
+  // debugMotorTest();
+  resetDeskHeightToZero();
   int32_t savedHeight = readDeskHeight();
   stepper->setCurrentPosition(savedHeight);
   Serial.println((String)"Initial desk height: " + savedHeight);
@@ -204,4 +230,10 @@ void loop() {
     onMotorStop();
   }
   wasRunning = isRunning;
+
+  int32_t currentHeight = stepper->getCurrentPosition();
+  if (currentHeight != lastDisplayedHeight) {
+    display.showNumberDec(currentHeight / 100, true);
+    lastDisplayedHeight = currentHeight;
+  }
 }
