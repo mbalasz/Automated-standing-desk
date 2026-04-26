@@ -4,17 +4,24 @@
 #include <TM1637Display.h>
 
 // --- Pin Definitions ---
-#define DESK_UP_PIN             18
-#define DESK_DOWN_PIN           13
-#define PRESET_1_PIN            5
-#define PRESET_2_PIN            17
-#define DIR_PIN                 27
-#define ENABLE_PIN              33  // MF+ on DM542Y
-#define STEP_PIN                26
-#define DIST_SENSOR_TRIG_PIN    22
-#define DIST_SENSOR_ECHO_PIN    23
+
+// Display (TM1637, Side A)
 #define DISPLAY_CLK_PIN         2
 #define DISPLAY_DIO_PIN         15
+
+// Buttons (Side A)
+#define DESK_UP_PIN             16
+#define DESK_DOWN_PIN           23
+#define PRESET_1_PIN            17
+#define PRESET_2_PIN            5
+#define BUTTON_5_GND_PIN        22  // software GND (driven LOW)
+#define BUTTON_5_PIN            18
+
+// Motor driver (DM542Y, Side B)
+#define STEPPER_GND_PIN         26  // software GND (driven LOW)
+#define DIR_PIN                 25
+#define STEP_PIN                33
+#define ENABLE_PIN              32  // MF+ on DM542Y
 
 // --- Motor Parameters ---
 // Driver: DM542Y at 1600 steps/rev (1/8 microstepping, SW5-SW8 DIP switches).
@@ -24,8 +31,8 @@
 //   e.g. 4347 steps/s → ~0.91 cm/s → ~33 s for a 30 cm range (conservative)
 //
 // TODO: raise MOTOR_MAX_SPEED_HZ to ~14000 for a more typical desk speed of ~3 cm/s (~10 s for 30 cm).
-#define MOTOR_MAX_SPEED_HZ      2000   // steps/s at full speed
-#define MOTOR_ACCELERATION      900   // steps/s² — ramp steepness (higher = faster ramp)
+#define MOTOR_MAX_SPEED_HZ      1500   // steps/s at full speed
+#define MOTOR_ACCELERATION      500   // steps/s² — ramp steepness (higher = faster ramp)
 #define MOTOR_MAX_STEPS         183000 // TODO: recalibrate by running desk end-to-end — measured at 2000 steps/rev, now invalid at 1600
 
 // Small reverse move after stopping to release mechanical tension in the leadscrew.
@@ -47,7 +54,6 @@ TM1637Display display(DISPLAY_CLK_PIN, DISPLAY_DIO_PIN);
 
 MoveDirection moveDirection = IDLE;
 bool wasRunning = false;
-int32_t lastDisplayedHeight = -1;
 
 int moveUpButtonLastState = HIGH;
 int moveDownButtonLastState = HIGH;
@@ -104,16 +110,20 @@ void resetDeskHeightToZero() {
 // Called whenever the motor finishes any move (button release or preset arrival).
 // Applies a short reverse (backtrack) to release leadscrew tension, then persists height.
 void onMotorStop() {
-  display.showNumberDec(stepper->getCurrentPosition() / 100, true);
-
   int backtrackSteps = (moveDirection == UP) ? -BACKTRACK_STEPS_UP : BACKTRACK_STEPS_DOWN;
   Serial.println((String)"Backtracking " + backtrackSteps + " steps");
   stepper->move(backtrackSteps, /*blocking=*/true);
   int32_t finalHeight = stepper->getCurrentPosition();
-  lastDisplayedHeight = finalHeight;
   Serial.println((String)"Stopped at height: " + finalHeight);
   storeDeskHeight(finalHeight);
   moveDirection = IDLE;
+
+  display.setBrightness(0x0f, false);
+  delay(150);
+  display.showNumberDec(finalHeight / 100, true);
+  delay(150);
+  display.setBrightness(0x0f, true);
+  display.showNumberDec(finalHeight / 100, true);
 }
 
 void moveUp() {
@@ -147,12 +157,24 @@ void checkPresetButtonStates() {
     if (state == LOW && presetButtonStates[i] == HIGH) {
       presetButtonPressedTimeMs = millis();
       presetButtonStates[i] = LOW;
-    } else if (state == HIGH && presetButtonStates[i] == LOW) {
-      if (millis() - presetButtonPressedTimeMs > 2000) {
+    } else if (state == LOW && presetButtonStates[i] == LOW) {
+      if (presetButtonPressedTimeMs != -1 && millis() - presetButtonPressedTimeMs > 2000) {
         storePreset(i + 1, stepper->getCurrentPosition());
-      } else {
+        for (int b = 0; b < 3; b++) {
+          display.setBrightness(0x0f, false);
+          display.showNumberDec(stepper->getCurrentPosition() / 100, true);
+          delay(100);
+          display.setBrightness(0x0f, true);
+          display.showNumberDec(stepper->getCurrentPosition() / 100, true);
+          delay(100);
+        }
+        presetButtonPressedTimeMs = -1;
+      }
+    } else if (state == HIGH && presetButtonStates[i] == LOW) {
+      if (presetButtonPressedTimeMs != -1) {
         moveToHeight(readPreset(i + 1));
       }
+      presetButtonPressedTimeMs = -1;
       presetButtonStates[i] = HIGH;
     }
   }
@@ -192,12 +214,15 @@ void debugMotorTest() {
 void setup() {
   Serial.begin(921600);
 
+  pinMode(STEPPER_GND_PIN,      OUTPUT);
+  digitalWrite(STEPPER_GND_PIN, LOW);
   pinMode(DESK_UP_PIN,          INPUT_PULLUP);
   pinMode(DESK_DOWN_PIN,        INPUT_PULLUP);
   pinMode(PRESET_1_PIN,         INPUT_PULLUP);
   pinMode(PRESET_2_PIN,         INPUT_PULLUP);
-  pinMode(DIST_SENSOR_ECHO_PIN, INPUT_PULLDOWN);
-  pinMode(DIST_SENSOR_TRIG_PIN, OUTPUT);
+  pinMode(BUTTON_5_GND_PIN,     OUTPUT);
+  digitalWrite(BUTTON_5_GND_PIN, LOW);
+  pinMode(BUTTON_5_PIN,         INPUT_PULLUP);
 
   display.setBrightness(0x0f);
   display.showNumberDecEx(0, 0, true);
@@ -231,6 +256,7 @@ void loop() {
   }
   wasRunning = isRunning;
 
+  static int32_t lastDisplayedHeight = -1;
   int32_t currentHeight = stepper->getCurrentPosition();
   if (currentHeight != lastDisplayedHeight) {
     display.showNumberDec(currentHeight / 100, true);
