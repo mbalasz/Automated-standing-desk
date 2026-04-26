@@ -31,8 +31,10 @@
 //   e.g. 4347 steps/s → ~0.91 cm/s → ~33 s for a 30 cm range (conservative)
 //
 // TODO: raise MOTOR_MAX_SPEED_HZ to ~14000 for a more typical desk speed of ~3 cm/s (~10 s for 30 cm).
-#define MOTOR_MAX_SPEED_HZ      1500
+#define MOTOR_MAX_SPEED_HZ      2500
 #define MOTOR_ACCELERATION      500
+#define STEPS_PER_CM            1338  // calibrated: 149800 steps = 112cm
+#define DISPLAY_TIMEOUT_MS      10000
 
 // Calibration mode: very slow movement so the desk can be inched to true zero.
 #define CAL_SPEED_HZ            300
@@ -59,6 +61,8 @@ TM1637Display display(DISPLAY_CLK_PIN, DISPLAY_DIO_PIN);
 MoveDirection moveDirection = IDLE;
 bool wasRunning = false;
 int32_t lastDisplayedHeight = -1;
+unsigned long lastActivityMs = 0;
+bool displayOn = true;
 
 int moveUpButtonLastState = HIGH;
 int moveDownButtonLastState = HIGH;
@@ -112,13 +116,18 @@ int32_t readDeskHeight() {
 }
 
 // --- Display Helpers ---
-void blinkDisplay(int32_t value, int count) {
+
+void showHeight(int32_t steps) {
+  display.showNumberDec(steps / STEPS_PER_CM, false);
+}
+
+void blinkDisplay(int32_t steps, int count) {
   for (int i = 0; i < count; i++) {
     display.setBrightness(0x0f, false);
-    display.showNumberDec(value, true);
+    showHeight(steps);
     delay(100);
     display.setBrightness(0x0f, true);
-    display.showNumberDec(value, true);
+    showHeight(steps);
     delay(100);
   }
 }
@@ -136,6 +145,8 @@ void enterCalibrationMode() {
   Serial.println("Entering calibration mode");
   stepper->setCurrentPosition(MOTOR_MAX_STEPS / 2);
   setMotorSpeed(CAL_SPEED_HZ, CAL_ACCELERATION);
+  displayOn = true;
+  display.setBrightness(0x0f, true);
 }
 
 void exitCalibrationMode() {
@@ -148,7 +159,7 @@ void exitCalibrationMode() {
   setMotorSpeed(MOTOR_MAX_SPEED_HZ, MOTOR_ACCELERATION);
   lastDisplayedHeight = -1; // force display refresh on next loop tick
   display.setBrightness(0x0f, true);
-  display.showNumberDec(0, true);
+  showHeight(0);
 }
 
 void checkModeButtonState() {
@@ -191,7 +202,7 @@ void onMotorStop() {
   storeDeskHeight(finalHeight);
   moveDirection = IDLE;
 
-  blinkDisplay(finalHeight / 100, 1);
+  blinkDisplay(finalHeight, 1);
 }
 
 void moveUp() {
@@ -285,7 +296,7 @@ void setup() {
   pinMode(MODE_BUTTON_PIN,       INPUT_PULLUP);
 
   display.setBrightness(0x0f);
-  display.showNumberDecEx(0, 0, true);
+  showHeight(0);
 
   engine.init();
   stepper = engine.stepperConnectToPin(STEP_PIN);
@@ -315,12 +326,26 @@ void loop() {
   }
   wasRunning = isRunning;
 
+  if (isRunning) lastActivityMs = millis();
+
   if (calibrationMode) {
     updateCalibrationDisplay();
-  } else {
+    return;
+  }
+
+  if (!displayOn && isRunning) {
+    displayOn = true;
+    display.setBrightness(0x0f, true);
+    lastDisplayedHeight = -1;
+  } else if (displayOn && !isRunning && millis() - lastActivityMs > DISPLAY_TIMEOUT_MS) {
+    displayOn = false;
+    display.setBrightness(0x0f, false);
+  }
+
+  if (displayOn) {
     int32_t currentHeight = stepper->getCurrentPosition();
     if (currentHeight != lastDisplayedHeight) {
-      display.showNumberDec(currentHeight / 100, true);
+      showHeight(currentHeight);
       lastDisplayedHeight = currentHeight;
     }
   }
