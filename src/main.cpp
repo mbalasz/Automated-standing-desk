@@ -2,6 +2,12 @@
 #include <Preferences.h>
 #include "FastAccelStepper.h"
 #include <TM1637Display.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// --- WiFi / Tasmota ---
+// WIFI_SSID, WIFI_PASS, TASMOTA_IP are injected via build_flags from secrets.ini (see platformio.ini)
+#define PSU_TIMEOUT_MS          15000UL          // 15 seconds
 
 // --- Pin Definitions ---
 
@@ -70,6 +76,8 @@ const int PRESET_BUTTONS_PINS[] = {PRESET_2_PIN, PRESET_1_PIN};
 int presetButtonStates[] = {HIGH, HIGH};
 unsigned long presetButtonPressedTimeMs[] = {0, 0};
 
+bool psuOn = true;
+
 bool calibrationMode = false;
 int modeButtonLastState = HIGH;
 unsigned long modeButtonPressedTimeMs = 0;
@@ -77,8 +85,68 @@ unsigned long calBlinkLastMs = 0;
 bool calBlinkOn = true;
 
 // "CAL " — C=0x39, A=0x77, L=0x38, blank=0x00
-const uint8_t CAL_SEGMENTS[] = {0x39, 0x77, 0x38, 0x00};
+const uint8_t CAL_SEGMENTS[]  = {0x39, 0x77, 0x38, 0x00};
 const uint8_t BLANK_SEGMENTS[] = {0x00, 0x00, 0x00, 0x00};
+// "----" shown while PSU is waking up
+const uint8_t WAKE_SEGMENTS[]  = {0x40, 0x40, 0x40, 0x40};
+// "Err " — E=0x79, r=0x50, r=0x50, blank
+const uint8_t ERR_SEGMENTS[]   = {0x79, 0x50, 0x50, 0x00};
+// "conn" — C=0x39, o=0x5C, n=0x54, n=0x54
+const uint8_t CONN_SEGMENTS[]  = {0x39, 0x5C, 0x54, 0x54};
+
+// --- WiFi / PSU ---
+
+void connectWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED)
+    Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
+  else
+    Serial.println("\nWiFi connection failed");
+}
+
+// Returns true if the plug acknowledged the command.
+bool setPsuPower(bool on) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  HTTPClient http;
+  String url = String("http://") + TASMOTA_IP + "/cm?cmnd=Power%20" + (on ? "On" : "Off");
+  http.begin(url);
+  http.setTimeout(3000);
+  int code = http.GET();
+  bool ok = false;
+  if (code == 200) {
+    String body = http.getString();
+    ok = body.indexOf(on ? "\"ON\"" : "\"OFF\"") >= 0;
+  }
+  http.end();
+  Serial.println(String("PSU ") + (on ? "on" : "off") + (ok ? " OK" : " FAILED"));
+  return ok;
+}
+
+// Shows "----" while waiting for the PSU to come up.
+// Returns false if the plug could not be reached.
+bool wakeUpPsu() {
+  display.setBrightness(0x0f, true);
+  display.setSegments(WAKE_SEGMENTS);
+  bool ok = setPsuPower(true);
+  if (!ok) {
+    display.setSegments(ERR_SEGMENTS);
+    delay(1500);
+    lastDisplayedHeight = -1;
+    return false;
+  }
+  delay(800); // wait for PSU rails to stabilize
+  psuOn = true;
+  displayOn = true;
+  lastActivityMs = millis();
+  lastDisplayedHeight = -1;
+  return true;
+}
 
 // --- NVS Helpers ---
 void storePreset(unsigned int presetNumber, int32_t height) {
@@ -240,12 +308,12 @@ void checkPresetButtonStates() {
       if (presetButtonPressedTimeMs[i] > 0 && millis() - presetButtonPressedTimeMs[i] > 2000) {
         int32_t height = stepper->getCurrentPosition();
         storePreset(i + 1, height);
-        blinkDisplay(height / 100, 3);
+        blinkDisplay(height, 3);
         presetButtonPressedTimeMs[i] = 0;
       }
     } else if (state == HIGH && presetButtonStates[i] == LOW) {
       if (presetButtonPressedTimeMs[i] > 0) {
-        moveToHeight(readPreset(i + 1));
+        if (psuOn || wakeUpPsu()) moveToHeight(readPreset(i + 1));
       }
       presetButtonPressedTimeMs[i] = 0;
       presetButtonStates[i] = HIGH;
@@ -257,11 +325,13 @@ void checkMoveButtonStates() {
   int upState   = digitalRead(DESK_UP_PIN);
   int downState = digitalRead(DESK_DOWN_PIN);
 
-  if (upState == LOW && moveUpButtonLastState == HIGH)          moveUp();
-  else if (upState == HIGH && moveUpButtonLastState == LOW)     stepper->stopMove();
+  if (upState == LOW && moveUpButtonLastState == HIGH) {
+    if (psuOn || wakeUpPsu()) moveUp();
+  } else if (upState == HIGH && moveUpButtonLastState == LOW) stepper->stopMove();
 
-  if (downState == LOW && moveDownButtonLastState == HIGH)      moveDown();
-  else if (downState == HIGH && moveDownButtonLastState == LOW) stepper->stopMove();
+  if (downState == LOW && moveDownButtonLastState == HIGH) {
+    if (psuOn || wakeUpPsu()) moveDown();
+  } else if (downState == HIGH && moveDownButtonLastState == LOW) stepper->stopMove();
 
   moveUpButtonLastState   = upState;
   moveDownButtonLastState = downState;
@@ -285,6 +355,14 @@ void debugMotorTest() {
 void setup() {
   Serial.begin(921600);
 
+  display.setBrightness(0x0f);
+  display.setSegments(CONN_SEGMENTS);
+
+  connectWiFi();
+  setPsuPower(true);
+
+  showHeight(0);
+
   pinMode(STEPPER_GND_PIN,       OUTPUT);
   digitalWrite(STEPPER_GND_PIN,  LOW);
   pinMode(DESK_UP_PIN,           INPUT_PULLUP);
@@ -294,9 +372,6 @@ void setup() {
   pinMode(MODE_BUTTON_GND_PIN,   OUTPUT);
   digitalWrite(MODE_BUTTON_GND_PIN, LOW);
   pinMode(MODE_BUTTON_PIN,       INPUT_PULLUP);
-
-  display.setBrightness(0x0f);
-  showHeight(0);
 
   engine.init();
   stepper = engine.stepperConnectToPin(STEP_PIN);
@@ -310,6 +385,7 @@ void setup() {
 
   // debugMotorTest();
   // storeDeskHeight(0); // one-off recalibration: uncomment, upload, re-comment, re-upload
+  lastActivityMs = millis();
   int32_t savedHeight = readDeskHeight();
   stepper->setCurrentPosition(savedHeight);
   Serial.println((String)"Initial desk height: " + savedHeight);
@@ -328,6 +404,10 @@ void loop() {
 
   if (isRunning) lastActivityMs = millis();
 
+  if (psuOn && !calibrationMode && !isRunning && millis() - lastActivityMs > PSU_TIMEOUT_MS) {
+    if (WiFi.status() != WL_CONNECTED || setPsuPower(false)) psuOn = false;
+  }
+
   if (calibrationMode) {
     updateCalibrationDisplay();
     return;
@@ -340,6 +420,7 @@ void loop() {
   } else if (displayOn && !isRunning && millis() - lastActivityMs > DISPLAY_TIMEOUT_MS) {
     displayOn = false;
     display.setBrightness(0x0f, false);
+    display.setSegments(BLANK_SEGMENTS); // push off state to hardware; setBrightness alone doesn't transmit
   }
 
   if (displayOn) {
